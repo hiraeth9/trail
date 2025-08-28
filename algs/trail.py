@@ -34,6 +34,15 @@ class TRAIL(AlgorithmBase):
         self.trust_pen = 0.045  # 中继低信任惩罚
         self.rel_w = 0.35  # 可靠性记忆(直达BS成功率)的权重
         self.mode_by_ch = {}  # 记录上一轮CH采用 direct/relay
+        # —— 自适应调参用的全局计数 & 边界 ——
+        self.alpha_min, self.alpha_max = 0.95, 1.08
+        self.alpha_step = 0.01
+        # 统计 direct/relay 在“看门狗判定”下的成功/总数，用于调 alpha / 冗余强度
+        self._rel_s = self._rel_t = 0
+        self._dir_s = self._dir_t = 0
+        # 冗余强度边界，供自适应调整
+        self.rt_min, self.rt_max = 0.10, 0.35
+
 
     def select_cluster_heads(self):
         sim=self.sim
@@ -55,8 +64,12 @@ class TRAIL(AlgorithmBase):
             if random.random()<p:
                 n.is_ch=True; n.last_ch_round=sim.round
                 sim.clusters[n.nid]=Cluster(n.nid)
-        # 若CH数低于存活节点的 ~3%，再补选若干个分数最高的
-        if len(sim.clusters) < max(1, int(0.03 * len(alive))):
+        # —— 自适应 CH 比例：基础3%，平均队列每+1层 → 目标提升+1%，封顶+6% ——
+
+        avg_q = float(np.mean([n.last_queue_level for n in alive])) if alive else 0.0
+        target_ratio = 0.03 + clamp((avg_q - 1.0) * 0.01, 0.0, 0.03)  # 3% ~ 6%
+        need_total = max(1, int(target_ratio * len(alive)))
+        if len(sim.clusters) < need_total:
             scored = []
             for nn in [x for x in alive if not x.is_ch]:
                 ee = (nn.energy - e_min) / (e_max - e_min + 1e-9)
@@ -67,10 +80,10 @@ class TRAIL(AlgorithmBase):
                 sc = 0.44 * ee + 0.26 * (tt - 0.10 * ss) + 0.15 * qq + 0.15 * bb
                 scored.append((sc, nn))
             scored.sort(key=lambda x: x[0], reverse=True)
-            need = max(1, int(0.03 * len(alive))) - len(sim.clusters)
-            for _, pick in scored[:need]:
-                pick.is_ch = True;
-                pick.last_ch_round = sim.round;
+            need = need_total - len(sim.clusters)
+            for _, pick in scored[:max(0, need)]:
+                pick.is_ch = True
+                pick.last_ch_round = sim.round
                 sim.clusters[pick.nid] = Cluster(pick.nid)
 
     def allow_member_redundancy(self, member:Node, ch:Node)->bool:
@@ -115,11 +128,15 @@ class TRAIL(AlgorithmBase):
         best_cost = best[4]
         # 采用ε-贪心探索
         explore = (random.random() < self.epsilon)
+        # 拥塞感知：网络平均队列高时，要求中继比CH更“空”（+1）；否则放宽到+2
+        net_avg_q = float(np.mean([n.last_queue_level for n in sim.alive_nodes()])) if sim.alive_nodes() else 0.0
+        qlimit = 1 if net_avg_q > 1.5 else 2
         if explore:
             use_relay = (random.random() < 0.5)
         else:
-            use_relay = (best_cost + 1e-12) < (self.alpha * cost_direct) and (
-                        relay.queue_level <= ch.queue_level + 2) and (relay.energy > 0.08)
+            use_relay = (best_cost + 1e-12) < (self.alpha * cost_direct) and \
+                        (relay.queue_level <= ch.queue_level + qlimit) and (relay.energy > 0.08)
+
         # 衰减探索率
         self.epsilon = max(self.min_epsilon, self.epsilon * self.eps_decay)
         self.mode_by_ch[ch.nid] = ('relay' if use_relay else 'direct')
@@ -134,6 +151,13 @@ class TRAIL(AlgorithmBase):
         neigh.sort(key=lambda x: x[0]);
         watchers = [p[1] for p in neigh[:3]]  # 多一个观察者更稳
         mode = self.mode_by_ch.get(ch.nid, 'direct')
+        # —— 记录一次全局成败（避免按观察者重复计数） ——
+        if mode == 'direct':
+            self._dir_t += 1
+            if ok: self._dir_s += 1
+        else:
+            self._rel_t += 1
+            if ok: self._rel_s += 1
         for _w in watchers:
             if ok and timely:
                 # 成功：降低可疑，增加可靠性记忆
@@ -162,4 +186,23 @@ class TRAIL(AlgorithmBase):
                     (n.consecutive_strikes >= self.strike_threshold) or \
                     (n.suspicion >= 0.85 and n.consecutive_strikes >= 1):
                 n.blacklisted = True
+        # —— 全局自适应：基于 direct/relay 的近端PDR，微调两跳阈值与冗余强度 ——
+        alive_now = sim.alive_nodes()
+        tot = self._rel_t + self._dir_t
+        # 每轮至少积累一定样本再调整（避免抖动）
+        if tot >= max(10, int(0.2 * len(alive_now) + 1)):
+            rel_pdr = (self._rel_s / max(1, self._rel_t))
+            dir_pdr = (self._dir_s / max(1, self._dir_t))
+            if rel_pdr > dir_pdr + 0.03:
+                # relay 明显更稳：适度放宽 alpha，并略增冗余强度
+                self.alpha = min(self.alpha_max, self.alpha + self.alpha_step)
+                self.rt_ratio = min(self.rt_max, self.rt_ratio * 1.05)
+            elif dir_pdr > rel_pdr + 0.03:
+                # direct 更稳：收紧 alpha，并略降冗余强度
+                self.alpha = max(self.alpha_min, self.alpha - self.alpha_step)
+                self.rt_ratio = max(self.rt_min, self.rt_ratio * 0.95)
+            # 指数遗忘，保持灵敏但不震荡
+            self._rel_s *= 0.5; self._rel_t *= 0.5
+            self._dir_s *= 0.5; self._dir_t *= 0.5
+
 
