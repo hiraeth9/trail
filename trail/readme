@@ -15,7 +15,7 @@ python run_all.py --all --ratios 0.1,0.2,0.3,0.4,0.5 --until-dead
 # 重复 5 次不同随机种子
 python run_all.py --all --ratios 0.1,0.2,0.3,0.4,0.5 --until-dead --seeds 5
 
-
+---------------------------------------------------------------
 只跑单个算法到能量耗尽（恶意比例 30%）
 
 python run_all.py --algo trail --until-dead
