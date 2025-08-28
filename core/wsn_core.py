@@ -141,90 +141,205 @@ class Simulation:
             self.clusters[chosen.nid].members.append(n.nid)
 
     def transmit_round(self):
-        alive=self.alive_nodes(); chs=[n for n in alive if n.is_ch]
-        if not chs: return
-        data_events={}; expected_by_ch={ch.nid:set() for ch in chs}
+        alive = self.alive_nodes()
+        chs = [n for n in alive if n.is_ch]
+        if not chs:
+            return
+
+        # —— 1) 成员上行：记录每个成员的发包路径与期望到达的CH —— #
+        data_events = {}
+        expected_by_ch = {ch.nid: set() for ch in chs}
         for cl in self.clusters.values():
-            ch=self.nodes[cl.ch_id]
-            if not ch.alive: continue
+            ch = self.nodes[cl.ch_id]
+            if not ch.alive:
+                continue
             for mid in cl.members:
-                m=self.nodes[mid]
-                if not m.alive: continue
-                allow=self.algo.allow_member_redundancy(m, ch)
-                rec=self._member_send(m, ch, allow, chs)
-                if mid not in data_events: data_events[mid]={'tx_paths':[], 'delivered':False,'timely':False}
+                m = self.nodes[mid]
+                if not m.alive:
+                    continue
+                allow = self.algo.allow_member_redundancy(m, ch)
+                rec = self._member_send(m, ch, allow, chs)
+                if mid not in data_events:
+                    data_events[mid] = {'tx_paths': [], 'delivered': False, 'timely': False}
                 for rid in rec:
-                    e_cost=e_tx(DATA_PACKET_BITS, dist(m.pos(), self.nodes[rid].pos()))
+                    e_cost = e_tx(DATA_PACKET_BITS, dist(m.pos(), self.nodes[rid].pos()))
                     data_events[mid]['tx_paths'].append((e_cost, rid))
                     expected_by_ch[rid].add(mid)
+
+        # —— 2) CH侧：统计“应到未到/已到”的观测 —— #
         for cl in self.clusters.values():
-            ch=self.nodes[cl.ch_id]
-            if not ch.alive: continue
-            expected=set(cl.members); got=expected_by_ch[ch.nid]; missing=expected-got
+            ch = self.nodes[cl.ch_id]
+            if not ch.alive:
+                continue
+            expected = set(cl.members)
+            got = expected_by_ch[ch.nid]
+            missing = expected - got
             for _ in missing:
-                ch.observed_fail+=0.1; self.total_drop+=1
+                ch.observed_fail += 0.1
+                self.total_drop += 1
             for _ in got:
-                ch.observed_success+=0.3
-        delivered_by_ch={}
+                ch.observed_success += 0.3
+
+        # —— 3) CH下行：聚合能耗、决定直达or两跳、能量记账、看门狗 —— #
+        delivered_by_ch = {}
         for ch in chs:
-            if not ch.alive: continue
-            n_recv=ch.queue_level
-            if n_recv>0:
-                e_aggr=E_DA*DATA_PACKET_BITS*n_recv
-                if ch.energy>=e_aggr: ch.energy-=e_aggr; self.total_energy_used+=e_aggr
-                else: ch.alive=False; continue
-            do_drop=False; do_delay=False
-            if ch.node_type=="malicious":
-                r=random.random()
-                if r<P_MAL_CH_DROP: do_drop=True
-                elif r<P_MAL_CH_DROP+P_MAL_CH_DELAY: do_delay=True
-            ok=False; timely=False; hops=0
-            if do_drop:
-                self.malicious_drop_packets+=n_recv; self.total_drop+=n_recv
-                ch.observed_fail+=1.0; ch.suspicion=min(1.0, ch.suspicion+0.3); ch.consecutive_strikes+=1
-            else:
-                relay,_meta=self.algo.choose_ch_relay(ch, chs)
-                if relay is not None and relay.alive:
-                    d1=dist(ch.pos(), relay.pos()); e1=e_tx(DATA_PACKET_BITS, d1)
-                    if ch.energy>=e1 and relay.energy>=e_rx(DATA_PACKET_BITS):
-                        ch.energy-=e1; self.total_energy_used+=e1
-                        relay.energy-=e_rx(DATA_PACKET_BITS); self.total_energy_used+=e_rx(DATA_PACKET_BITS)
-                        relay.queue_level += n_recv
-                        d2=dist(relay.pos(), self.bs); e2=e_tx(DATA_PACKET_BITS, d2)
-                        if relay.energy>=e2:
-                            relay.energy-=e2; self.total_energy_used+=e2
-                            ok=True; timely=(not do_delay); hops=2
-                            if do_delay: self.malicious_delay_times+=1; ch.observed_fail+=0.5
-                            else: ch.observed_success+=1.0; ch.consecutive_strikes=0
-                        else:
-                            relay.alive=False; self.total_drop+=n_recv
-                    else:
-                        ch.alive=False; self.total_drop+=n_recv
+            if not ch.alive:
+                continue
+
+            n_recv = ch.queue_level  # 本轮收到的成员数量（用于聚合与发包）
+            used_relay = False  # 本轮是否采用两跳（供算法层调参/看门狗使用）
+            ok = False
+            timely = False
+            hops = 0
+
+            # 3.1 聚合处理能耗（有包才聚合）
+            if n_recv > 0:
+                e_aggr = E_DA * DATA_PACKET_BITS * n_recv
+                if ch.energy >= e_aggr:
+                    ch.energy -= e_aggr
+                    self.total_energy_used += e_aggr
                 else:
-                    d_bs=dist(ch.pos(), self.bs); e_ch=e_tx(DATA_PACKET_BITS, d_bs)
-                    if ch.energy>=e_ch:
-                        ch.energy-=e_ch; self.total_energy_used+=e_ch
-                        ok=True; timely=(not do_delay); hops=1
-                        if do_delay: self.malicious_delay_times+=1; ch.observed_fail+=0.5
-                        else: ch.observed_success+=1.0; ch.consecutive_strikes=0
+                    # 聚合能量都不够 → 本轮包都掉；但CH未必“死亡”，按能耗模型可以选择判死
+                    ch.alive = False
+                    self.total_drop += n_recv
+                    delivered_by_ch[ch.nid] = (False, False, 0)
+                    # 正确记录本轮负载并清空队列
+                    ch.last_queue_level = n_recv
+                    ch.queue_level = 0
+                    self.algo.mode_by_ch[ch.nid] = 'direct'
+                    self.algo.apply_watchdog(ch, False, False, chs)
+                    continue
+
+            # 3.2 恶意CH行为决定（丢弃/延迟）
+            do_drop = False
+            do_delay = False
+            if ch.node_type == "malicious":
+                r = random.random()
+                if r < P_MAL_CH_DROP:
+                    do_drop = True
+                elif r < P_MAL_CH_DROP + P_MAL_CH_DELAY:
+                    do_delay = True
+
+            # 3.3 发包：先尝试两跳；若两跳的“首跳收发”条件不满足，回退直达
+            if do_drop and n_recv > 0:
+                # 恶意直接丢
+                self.malicious_drop_packets += n_recv
+                self.total_drop += n_recv
+                ch.observed_fail += 1.0
+                ch.suspicion = min(1.0, ch.suspicion + 0.3)
+                ch.consecutive_strikes += 1
+            else:
+                relay, _meta = self.algo.choose_ch_relay(ch, chs)
+                if relay is not None and relay.alive and n_recv > 0:
+                    # —— 两跳：首跳（CH→relay）
+                    d1 = dist(ch.pos(), relay.pos())
+                    e1 = e_tx(DATA_PACKET_BITS, d1)
+                    e_rx_once = e_rx(DATA_PACKET_BITS)
+                    if ch.energy >= e1 and relay.energy >= e_rx_once:
+                        ch.energy -= e1
+                        self.total_energy_used += e1
+                        relay.energy -= e_rx_once
+                        self.total_energy_used += e_rx_once
+
+                        # —— 两跳：次跳（relay→BS）
+                        d2 = dist(relay.pos(), self.bs)
+                        e2 = e_tx(DATA_PACKET_BITS, d2)
+                        if relay.energy >= e2:
+                            relay.energy -= e2
+                            self.total_energy_used += e2
+                            ok = True
+                            timely = (not do_delay)
+                            hops = 2
+                            used_relay = True
+                            if do_delay:
+                                self.malicious_delay_times += 1
+                                ch.observed_fail += 0.5
+                            else:
+                                ch.observed_success += 1.0
+                                ch.consecutive_strikes = 0
+                        else:
+                            # 中继在次跳时没电了 → 包丢；中继死亡合理
+                            relay.alive = False
+                            self.total_drop += n_recv
+                            ch.observed_fail += 0.6
                     else:
-                        ch.alive=False; self.total_drop+=n_recv
-            delivered_by_ch[ch.nid]=(ok,timely,hops)
-            ch.last_queue_level=ch.queue_level
+                        # ⚠ 首跳条件不满足：不要直接“杀CH”，先尝试改为直达
+                        d_bs = dist(ch.pos(), self.bs)
+                        e_ch = e_tx(DATA_PACKET_BITS, d_bs)
+                        if ch.energy >= e_ch and n_recv > 0:
+                            ch.energy -= e_ch
+                            self.total_energy_used += e_ch
+                            ok = True
+                            timely = (not do_delay)
+                            hops = 1
+                            used_relay = False
+                            if do_delay:
+                                self.malicious_delay_times += 1
+                                ch.observed_fail += 0.5
+                            else:
+                                ch.observed_success += 1.0
+                                ch.consecutive_strikes = 0
+                        else:
+                            ch.alive = False
+                            self.total_drop += n_recv
+                            ch.observed_fail += 0.6
+                else:
+                    # —— 直达（无合适中继/没有数据/或中继已死）
+                    if n_recv > 0:
+                        d_bs = dist(ch.pos(), self.bs)
+                        e_ch = e_tx(DATA_PACKET_BITS, d_bs)
+                        if ch.energy >= e_ch:
+                            ch.energy -= e_ch
+                            self.total_energy_used += e_ch
+                            ok = True
+                            timely = (not do_delay)
+                            hops = 1
+                            used_relay = False
+                            if do_delay:
+                                self.malicious_delay_times += 1
+                                ch.observed_fail += 0.5
+                            else:
+                                ch.observed_success += 1.0
+                                ch.consecutive_strikes = 0
+                        else:
+                            ch.alive = False
+                            self.total_drop += n_recv
+                            ch.observed_fail += 0.6
+                    else:
+                        # 本轮无数据可发：保持 ok=False / hops=0
+                        used_relay = False
+
+            delivered_by_ch[ch.nid] = (ok, timely, hops)
+
+            # 3.4 正确记录与重置队列（很关键！）
+            ch.last_queue_level = n_recv
+            ch.queue_level = 0
+
+            # 3.5 告知算法层本轮选择，用于看门狗/自适应
+            self.algo.mode_by_ch[ch.nid] = 'relay' if used_relay else 'direct'
             self.algo.apply_watchdog(ch, ok, timely, chs)
-        for mid,info in data_events.items():
-            delivered=[]; timely_flag=False; hop_used=0
+
+        # —— 4) 汇总成员下行结果（每个成员看自己所有上行路径里是否有成功的CH） —— #
+        for mid, info in data_events.items():
+            delivered = []
+            timely_flag = False
+            hop_used = 0
             for e_cost, ch_id in info['tx_paths']:
-                ok,t,h = delivered_by_ch.get(ch_id,(False,False,0))
+                ok, t, h = delivered_by_ch.get(ch_id, (False, False, 0))
                 if ok:
                     delivered.append(e_cost)
                     timely_flag = timely_flag or t
                     hop_used = max(hop_used, h)
             if delivered:
-                info['delivered']=True; info['timely']=timely_flag
-                self.total_delivered+=1; self.total_hop_count += (hop_used if hop_used>0 else 1)
-                if timely_flag: self.total_timely_delivered+=1
+                info['delivered'] = True
+                info['timely'] = timely_flag
+                self.total_delivered += 1
+                self.total_hop_count += (hop_used if hop_used > 0 else 1)
+                if timely_flag:
+                    self.total_timely_delivered += 1
                 self.member_energy_effective += min(delivered)
+
+        # —— 5) 每轮结束：更新信任/黑名单 & 自适应策略（若算法实现了的话） —— #
         self.algo.finalize_trust_blacklist()
 
     def _member_send(self, m:Node, ch:Node, allow_redundancy:bool, chs:List[Node]):
