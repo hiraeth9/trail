@@ -6,7 +6,6 @@ from core.wsn_core import AlgorithmBase, Simulation, Node, Cluster, dist, clamp,
     BASE_P_CH, CH_COOLDOWN, COMM_RANGE, CH_NEIGHBOR_RANGE, \
     e_tx, e_rx, DATA_PACKET_BITS
 
-
 class TRAIL(AlgorithmBase):
     @property
     def name(self): return "TRAIL (ours)"
