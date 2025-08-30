@@ -121,8 +121,8 @@ class SHEER(AlgorithmBase):
                 n.is_ch = True; n.last_ch_round = sim.round
                 sim.clusters[n.nid] = Cluster(n.nid)
 
-        # 2) 保底：按 CS 从高到低补齐到期望下限（例如 ≥3% 活跃节点）
-        need_total = max(1, int(0.03 * len(alive)))
+        # 2) 保底：按 CS 从高到低补齐到期望下限（例如 ≥8% 活跃节点）
+        need_total = max(1, int(0.08 * len(alive)))
         if len(sim.clusters) < need_total:
             if not scored:
                 # 没有任何候选，放宽一次资格用于极端场景

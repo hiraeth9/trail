@@ -246,7 +246,8 @@ class ACTAR(AlgorithmBase):
             nch = None
 
         if far:
-            ndc = self._estimate_ndc(far, nch if nch else random.choice(far))
+            # 增加簇头数量：将 ndc 乘以 2.5 倍
+            ndc = max(1, int(self._estimate_ndc(far, nch if nch else random.choice(far)) * 2.5))
             ranked = sorted(far, key=lambda n: self._mof(n, far), reverse=True)
             picked: List[Node] = []
             for n in ranked:
@@ -258,6 +259,7 @@ class ACTAR(AlgorithmBase):
             for ch in picked:
                 ch.is_ch = True; ch.last_ch_round = sim.round
                 sim.clusters[ch.nid] = Cluster(ch.nid)
+
 
         if len(sim.clusters) == 0 and cand:
             pick = random.choice(cand)

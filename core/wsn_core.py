@@ -21,7 +21,9 @@ DATA_PACKET_BITS = 4000;
 CTRL_PACKET_BITS = 200
 
 SIM_ROUNDS = 500
-BASE_P_CH = 0.07
+BASE_P_CH = 0.15
+
+
 CH_COOLDOWN = int(1.0 / BASE_P_CH)
 
 P_MAL_MEMBER_DROP = 0.25
@@ -285,7 +287,9 @@ class Simulation:
                     hop_used = max(hop_used, h)
             if delivered:
                 info['delivered']=True; info['timely']=timely_flag
-                self.total_delivered+=1; self.total_hop_count += (hop_used if hop_used>0 else 1)
+                self.total_delivered+=1
+                if hop_used > 0:
+                    self.total_hop_count += hop_used
                 if timely_flag: self.total_timely_delivered+=1
                 self.member_energy_effective += min(delivered)
         self.algo.finalize_trust_blacklist()
@@ -331,7 +335,7 @@ class Simulation:
                         alt.queue_level += 1
                     else:
                         alt.alive = False
-        self.member_energy_total += e * (2 if (allow_redundancy and len(rec) >= 2) else 1)
+        self.member_energy_total += e * len(rec)
         return rec
 
     def update_lifetime(self):

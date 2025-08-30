@@ -10,29 +10,29 @@ class TRAIL(AlgorithmBase):
     @property
     def name(self): return "TRAIL (ours)"
     @property
-    def trust_warn(self): return 0.55
+    def trust_warn(self): return 0.60
     @property
-    def trust_blacklist(self): return 0.35
+    def trust_blacklist(self): return 0.40
 
     @property
     def forget(self):
-        return 0.97
+        return 0.95
 
     @property
     def strike_threshold(self):
-        return 3
+        return 2
 
     def __init__(self, sim: 'Simulation'):
         super().__init__(sim)
         # —— 探索/冗余/能耗-可靠性策略参数 ——
-        self.rt_ratio = 0.24  # 仅在CH“临界可信”时才考虑冗余，基础概率更低
-        self.epsilon = 0.22  # 初始探索率↑，更快发现好中继
-        self.eps_decay = 0.996  # 探索缓慢衰减
-        self.min_epsilon = 0.04
-        self.alpha = 1.02  # 允许两跳能耗略高于直达，换可靠性/吞吐
-        self.queue_pen = 0.03  # 中继队列惩罚系数
-        self.trust_pen = 0.045  # 中继低信任惩罚
-        self.rel_w = 0.35  # 可靠性记忆(直达BS成功率)的权重
+        self.rt_ratio = 0.30  # 提高冗余比率以增加可靠性
+        self.epsilon = 0.18  # 降低初始探索率，减少随机性
+        self.eps_decay = 0.995  # 稍微加快探索衰减
+        self.min_epsilon = 0.03
+        self.alpha = 1.05  # 放宽两跳能耗阈值，提高中继使用率
+        self.queue_pen = 0.025  # 降低队列惩罚，鼓励使用中继
+        self.trust_pen = 0.035  # 降低信任惩罚
+        self.rel_w = 0.40  # 提高可靠性记忆权重
         self.mode_by_ch = {}  # 记录上一轮CH采用 direct/relay
         # —— 自适应调参用的全局计数 & 边界 ——
         self.alpha_min, self.alpha_max = 0.95, 1.08
@@ -58,16 +58,16 @@ class TRAIL(AlgorithmBase):
             q = 1.0 - (n.last_queue_level - q_min) / (q_max - q_min + 1e-9)
             b = 1.0 - (dist(n.pos(), sim.bs) - d_min) / (d_max - d_min + 1e-9)
             s_pen = 1.0 - max(0.0, min(1.0, 1.0 - n.suspicion))
-            # 能量优先，怀疑惩罚减半，轻度加权“更近BS”的中心性
-            score = 0.44 * e + 0.26 * (t - 0.10 * s_pen) + 0.15 * q + 0.15 * b
-            p = clamp(BASE_P_CH * (0.62 + score), 0.0, 1.0)
+            # 优化权重：提高信任权重，降低怀疑惩罚，增加队列和位置权重
+            score = 0.40 * e + 0.30 * (t - 0.08 * s_pen) + 0.18 * q + 0.12 * b
+            p = clamp(BASE_P_CH * (0.70 + score), 0.0, 1.0)
             if random.random()<p:
                 n.is_ch=True; n.last_ch_round=sim.round
                 sim.clusters[n.nid]=Cluster(n.nid)
-        # —— 自适应 CH 比例：基础3%，平均队列每+1层 → 目标提升+1%，封顶+6% ——
+        # —— 自适应 CH 比例：基础8%，平均队列每+1层 → 目标提升+1%，封顶+12% ——
 
         avg_q = float(np.mean([n.last_queue_level for n in alive])) if alive else 0.0
-        target_ratio = 0.03 + clamp((avg_q - 1.0) * 0.01, 0.0, 0.03)  # 3% ~ 6%
+        target_ratio = 0.08 + clamp((avg_q - 1.0) * 0.01, 0.0, 0.04)  # 8% ~ 12%
         need_total = max(1, int(target_ratio * len(alive)))
         if len(sim.clusters) < need_total:
             scored = []
@@ -112,11 +112,13 @@ class TRAIL(AlgorithmBase):
                 continue
             d2 = dist(other.pos(), sim.bs)
             two_hop_cost = e_tx(DATA_PACKET_BITS, d1) + e_rx(DATA_PACKET_BITS) + e_tx(DATA_PACKET_BITS, d2)
-            # 队列/信任惩罚；可靠性记忆(该中继“直达BS”历史成功率)做奖励
+            # 优化中继选择：降低队列惩罚，提高信任和可靠性权重
             rel = other.dir_val  # [0,1] 的EWMA
             penalty = (1.0 + self.queue_pen * other.queue_level + self.trust_pen * (1.0 - other.trust()))
-            reward = max(0.70, (1.0 - self.rel_w * rel))  # 最多降低 35% 的“有效成本”
-            score = two_hop_cost * penalty * reward
+            reward = max(0.65, (1.0 - self.rel_w * rel))  # 最多降低 35% 的“有效成本”
+            # 额外奖励高信任中继
+            trust_bonus = 1.0 - 0.15 * (1.0 - other.trust())
+            score = two_hop_cost * penalty * reward * trust_bonus
             cands.append((score, other, d1, d2, two_hop_cost))
         if not cands:
             self.mode_by_ch[ch.nid] = 'direct'
@@ -161,20 +163,22 @@ class TRAIL(AlgorithmBase):
         for _w in watchers:
             if ok and timely:
                 # 成功：降低可疑，增加可靠性记忆
-                ch.suspicion = max(0.0, ch.suspicion - 0.04)
+                ch.suspicion = max(0.0, ch.suspicion - 0.05)
+                ch.observed_success += 0.4
                 if mode == 'direct':
-                    ch.dir_val = 0.90 * ch.dir_val + 0.10 * 1.0;
+                    ch.dir_val = 0.88 * ch.dir_val + 0.12 * 1.0;
                     ch.dir_cnt += 1
                 else:
-                    ch.rly_val = 0.90 * ch.rly_val + 0.10 * 1.0;
+                    ch.rly_val = 0.88 * ch.rly_val + 0.12 * 1.0;
                     ch.rly_cnt += 1
             else:
                 # 失败：有限度地增加可疑，并轻微衰减可靠性
-                if random.random() < 0.65:
-                    ch.observed_fail += 0.55
-                    ch.suspicion = min(1.0, ch.suspicion + 0.18)
-                ch.dir_val *= 0.95;
-                ch.rly_val *= 0.95
+                if random.random() < 0.70:
+                    ch.observed_fail += 0.6
+                    ch.suspicion = min(1.0, ch.suspicion + 0.20)
+                    ch.consecutive_strikes += 1
+                ch.dir_val *= 0.93;
+                ch.rly_val *= 0.93
 
     def finalize_trust_blacklist(self):
         sim=self.sim
@@ -204,5 +208,3 @@ class TRAIL(AlgorithmBase):
             # 指数遗忘，保持灵敏但不震荡
             self._rel_s *= 0.5; self._rel_t *= 0.5
             self._dir_s *= 0.5; self._dir_t *= 0.5
-
-

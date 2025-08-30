@@ -131,9 +131,9 @@ class DST_WOA(AlgorithmBase):
             cs = self._dst_trust_of_node(n, alive)  # DST 合成置信
             scored.append((cs, n))
 
-        # 以 DST 置信降序选择前 3% 作为 CH（和 SHEER 实现一致的“保底比例”）
+        # 以 DST 置信降序选择前 8% 作为 CH（增加簇头数量）
         scored.sort(key=lambda t: t[0], reverse=True)
-        need_total = max(1, int(0.03 * len(alive)))
+        need_total = max(1, int(0.08 * len(alive)))
         sim.clusters.clear()
         for _, pick in scored[:need_total]:
             pick.is_ch = True
