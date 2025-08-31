@@ -1,399 +1,420 @@
 # -*- coding: utf-8 -*-
+"""
+DST-WOA（论文对齐版）
+- Phase 1: 基于 Dempster-Shafer 的可信 CH 选择（Eq.(7)-(10), Fig.1 Phase 1）
+- Phase 2: CH 回收再用（min_erg=0.6, tl=60）（Fig.1 Phase 2）
+- Phase 3: 路由：鲸鱼优化算法 WOA 选择下一跳（Eq.(11)-(12), Fig.1 Phase 3）
+参考：Peer-to-Peer Networking and Applications (2024) 17:1486–1498, "Trust-based clustering and routing in WSNs using DST-WOA"
+"""
+
 from typing import List, Tuple, Dict, Optional
-import random, math
+import math
+import random
 import numpy as np
 
-# 这些符号来自你的核心框架；如命名略有差异，请按工程替换
 from core.wsn_core import (
-    AlgorithmBase, Simulation, Node, Cluster, dist, e_tx, e_rx, clamp,
-    COMM_RANGE, CH_NEIGHBOR_RANGE, DATA_PACKET_BITS, CH_COOLDOWN
+    AlgorithmBase, Simulation, Node, Cluster,
+    dist, clamp,
+    BASE_P_CH, CH_COOLDOWN,
+    COMM_RANGE, CH_NEIGHBOR_RANGE,
 )
+
+# ================ 工具：欧式距离累加（Eq.(12)） ================
+def _avg_path_distance(pts: List[Tuple[float, float]]) -> float:
+    """Eq.(12) 的 Scdis：沿路段的距离均值；pts 为有序坐标序列（CLS->...->CLD）。"""
+    if len(pts) < 2:
+        return 0.0
+    segs = [dist(pts[i], pts[i+1]) for i in range(len(pts)-1)]
+    return float(np.mean(segs))
+
 
 class DST_WOA(AlgorithmBase):
     """
-    论文一致版本：DST-WOA
-    Phase-1: 基于 Dempster-Shafer 证据合成的 CH 选择
-    Phase-2: CH Recycling (min_erg, tl)
-    Phase-3: Whale Optimization Algorithm 选择最佳 CH→…→CH→BS 路径
-      Fitness = E + 1/D + 1/H + 1/Scdis   [Eq.(11)]
-      Scdis   = avg link distance along route [Eq.(12)]
-    参考：论文第 4 节伪代码与式(11)(12)；图 1 流程图。
+    DST-WOA 算法（与 trail/core/wsn_core.py 框架兼容）
+    提供主程序期望的 5 个钩子：
+      - select_cluster_heads
+      - allow_member_redundancy
+      - choose_ch_relay
+      - apply_watchdog
+      - finalize_trust_blacklist
     """
 
-    # ========= 可调参数（与论文一致/对齐） =========
-    # Phase-2：CH 回收阈值
-    min_erg_ratio = 0.60      # min_erg = 0.6（论文）——采用“相对初始”近似：使用全网中位能量比例
-    ttl_rounds    = 60        # tl = 60s；仿真每轮近似1秒时与论文等价；如非1s步长，请据实调整
+    # 论文参数（见文中 Phase 2）
+    MIN_ERG_RATIO = 0.60    # min_erg=0.6（相对初始能量）
+    TL_ROUNDS     = 60      # tl=60（以轮为单位近似 60s）
 
-    # WOA 参数（Phase-3）
-    WOA_POP   = 24
-    WOA_ITERS = 30
-    WOA_b     = 1.0           # 螺旋常数
-    WOA_max_hops = 8          # 限制 CH→BS 最大跳数（避免搜索爆炸）
+    # 论文聚类规模：每簇“约 20 个节点”（第4节 first paragraph）
+    TARGET_CLUSTER_SIZE = 20
 
-    # 兼容性保护（主程序信任/拉黑阈值）
-    trust_black = 0.35
-    forget      = 0.98
-    strike_threshold = 3
+    # 适应度（Eq.(11)-(12)）归一化、WOA 控制参数
+    WOA_POP_FACTOR = 3      # 种群规模系数：= min(10, 3*K)
+    WOA_ITERS      = 12     # 迭代次数
+    WOA_B          = 1.0    # 螺旋参数 b
+    # a 线性递减从 2->0（标准 WOA）
 
+    # 信任与黑名单（与主程序 Beta-trust 对齐）
     @property
-    def name(self): return "DST-WOA-2024"
-
-    @property
-    def trust_blacklist(self) -> float:
-        # 用我们在类里配置的黑名单阈值（之前用变量名 trust_black）
-        return getattr(self, "trust_black", 0.35)
+    def name(self) -> str:
+        return "DST-WOA-2024"
 
     @property
     def trust_warn(self) -> float:
-        # 可选的预警阈值；部分框架/工具代码可能会读取
-        return max(0.5, self.trust_blacklist + 0.2)
+        return 0.80
 
-    # ========== Phase-1：DST 信任与 CH 选择 ==========
+    @property
+    def trust_blacklist(self) -> float:
+        # 仅用于成员接入的软阈；CH 候选无硬阈，完全由 DST 融合结果排序决定
+        return 0.35
 
-    def _two_observers(self, x: Node, alive: List[Node]) -> List[Node]:
-        """选取两个“就近且可信”的邻居作为观察者（论文：两个邻居给出证据）"""
-        neigh = []
-        for n in alive:
-            if n.nid == x.nid or (not n.alive) or n.blacklisted: continue
-            d = dist(n.pos(), x.pos())
-            if d <= COMM_RANGE:
-                neigh.append((d, n.trust(), n))
-        # 距离近且 trust 高者优先
-        neigh.sort(key=lambda t: (t[0], -t[1]))
-        out = [n for _,__,n in neigh[:2]]
-        if len(out) < 2 and neigh:
-            out = [neigh[0][2]] * 2  # 退化情况：只有1个邻居时重复使用
-        return out
+    @property
+    def forget(self) -> float:
+        return 0.98
 
-    def _opinion_of(self, observer: Node, target: Node) -> float:
+    @property
+    def strike_threshold(self) -> int:
+        return 3
+
+    # ===== 内部观测：用于“邻居对邻居”的行为证据（馈入 DST 的 A1/A2） =====
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 记录边 (i->j) 的成功/失败（由 watchdog 回写）
+        self.obs: Dict[Tuple[int, int], Dict[str, float]] = {}
+        # CH->上一跳 的记录（以便 watchdog 归因）
+        self.last_relay_by_ch: Dict[int, Optional[int]] = {}
+        # 初始化节点基准能量（用于回收阈值）
+        if self.sim is not None:
+            for n in self.sim.nodes:
+                if not hasattr(n, "initial_energy"):
+                    n.initial_energy = n.energy
+
+    # --------------------- DST：证据构造与组合（Eq.(7)-(10)) ---------------------
+    def _get_obs(self, i: int, j: int) -> Dict[str, float]:
+        key = (i, j)
+        if key not in self.obs:
+            self.obs[key] = dict(p=0.0, n=0.0, last_ok=1.0)
+        return self.obs[key]
+
+    def _neighbor_belief_about(self, i: Node, j: Node) -> Tuple[float, float, float]:
         """
-        观察者对 target 的可信率 l \in [0,1]。
-        工程上若维护了邻居级意见，可从 observer.opinions[target.nid] 取用；
-        否则采用 sqrt(observer.trust() * target.trust()) 的保守合成。
+        邻居 i 对节点 j 的信任证据（A_i）：
+        返回 (m(T), m(F), m(Ω))，并保持 m(T)+m(F)+m(Ω)=1。
+        证据来源：对 (i->j) 的成功/失败观测 + 节点 j 的全局 Beta-trust 作为不确定补充。
         """
-        if hasattr(observer, "opinions") and isinstance(observer.opinions, dict):
-            if target.nid in observer.opinions:
-                return clamp(float(observer.opinions[target.nid]), 0.0, 1.0)
-        return clamp(math.sqrt(observer.trust() * target.trust()), 0.0, 1.0)
+        rec = self._get_obs(i.nid, j.nid)
+        total = rec['p'] + rec['n']
+        if total <= 0:
+            # 没有直接观测：给 0.5/0.5 的模糊意见，并把不确定分量留给 Ω
+            mT = 0.5 * j.trust()     # 倾向于全局信任（防止过拟合）
+            mF = 0.5 * (1.0 - j.trust())
+            mO = clamp(1.0 - (mT + mF), 0.0, 1.0)
+            return mT, mF, mO
+        # 有观测：p/(p+n) → T，(1-p/(p+n)) → F，剩余给 Ω
+        p_rate = rec['p'] / total
+        mT = clamp(0.7 * p_rate + 0.3 * j.trust(), 0.0, 1.0)  # 融合全局信任，增强鲁棒
+        mF = clamp(1.0 - mT, 0.0, 1.0) * 0.8                  # 适度保留冲突
+        mO = clamp(1.0 - mT - mF, 0.0, 1.0)
+        # 归一化
+        s = mT + mF + mO
+        if s <= 1e-9:
+            return 0.5, 0.5, 0.0
+        return mT/s, mF/s, mO/s
 
-    def _dst_combine_two(self, l1: float, l2: float) -> float:
+    def _dst_combine(self, m1: Tuple[float, float, float], m2: Tuple[float, float, float]) -> Tuple[float, float, float]:
         """
-        Dempster 组合：Ω={T,F}，两个邻居给出 A1(Y)=l1, A1(Y')=1-l1；A2 同理。
-        论文式(7)–(10) 的二元特例，实现冲突归一化 W 并返回对 {T} 的合成置信。 [Phase-1]
+        Dempster 组合（标准二元 {T,F} + Ω）：
+          m(T) = [m1(T)m2(T) + m1(T)m2(Ω) + m1(Ω)m2(T)] / (1-K)
+          m(F) = [m1(F)m2(F) + m1(F)m2(Ω) + m1(Ω)m2(F)] / (1-K)
+          m(Ω) = [m1(Ω)m2(Ω)] / (1-K)
+          K    = m1(T)m2(F) + m1(F)m2(T)
+        与论文 Eq.(7)-(10) 给出的三种情形一致（这是一致化的通式写法）。
         """
-        a1_t, a1_f = l1, (1.0 - l1)
-        a2_t, a2_f = l2, (1.0 - l2)
-        # 冲突项 K = A1(T)A2(F) + A1(F)A2(T)
-        K = a1_t * a2_f + a1_f * a2_t
-        W = 1.0 - K  # 论文中归一化因子 W；二元情形 W = 1-K
-        if W <= 1e-12:
-            return 0.5  # 完全冲突→不确定
-        # 合成对 {T} 的质量
-        mT = (a1_t * a2_t + a1_t * (0) + (0) * a2_t) / W  # 只剩交集 T∩T
-        # 二元特例下即 mT = (a1_t * a2_t) / W
-        return clamp(mT, 0.0, 1.0)
+        m1T, m1F, m1O = m1
+        m2T, m2F, m2O = m2
+        K = m1T*m2F + m1F*m2T
+        den = 1.0 - K
+        if den <= 1e-9:
+            # 完全冲突，退回到不确定
+            return 0.5, 0.5, 0.0
+        mT = (m1T*m2T + m1T*m2O + m1O*m2T) / den
+        mF = (m1F*m2F + m1F*m2O + m1O*m2F) / den
+        mO = (m1O*m2O) / den
+        # 归一化防数值漂移
+        s = mT + mF + mO
+        return mT/s, mF/s, mO/s
 
-    def _dst_trust_of_node(self, x: Node, alive: List[Node]) -> float:
-        """候选节点 x 的 DST 合成可信率（两个邻居给出 l1, l2 后按上式合成）"""
-        obs = self._two_observers(x, alive)
-        if len(obs) < 2:
-            # 无足够邻居：退化为自身 trust
-            return x.trust()
-        l1 = self._opinion_of(obs[0], x)
-        l2 = self._opinion_of(obs[1], x)
-        return self._dst_combine_two(l1, l2)
+    def _final_trust_rate(self, m: Tuple[float, float, float]) -> float:
+        """
+        论文将最终“信任率”视为 T 的置信；不确定性 Ω 以 0.5 权重计入（保守下注）。
+        """
+        mT, mF, mO = m
+        return clamp(mT + 0.5 * mO, 0.0, 1.0)
 
+    # --------------------------- Phase 1：CH 选择 ---------------------------
     def select_cluster_heads(self):
+        sim: Simulation = self.sim
+        alive = [n for n in sim.alive_nodes() if not n.blacklisted]
+        if not alive:
+            return
+
+        # 1) 先回收：检测现任 CH 是否满足 Phase 2 的电量/时间阈值
+        self._recycle_existing_chs()
+
+        # 2) 目标 CH 数量（约每簇 20 个节点）
+        target_ch = max(1, math.ceil(len(alive) / float(self.TARGET_CLUSTER_SIZE)))
+
+        # 3) 候选集合（冷却期）
+        candidates = [n for n in alive if (sim.round - n.last_ch_round) >= CH_COOLDOWN]
+
+        # 若现有 CH 已满足目标，不再补选
+        if len(sim.clusters) >= target_ch or not candidates:
+            return
+
+        # 4) 为每个候选计算 DST 信任率（融合“两个邻居”的证据）
+        #    邻居优先取通信半径内最近的两个；不足则用 Ω=1 的中性证据补足
+        scored: List[Tuple[float, Node]] = []
+        for u in candidates:
+            neigh = self._neighbors_within(u, alive, COMM_RANGE)
+            neigh.sort(key=lambda x: x[0])
+            if len(neigh) >= 2:
+                a1 = self._neighbor_belief_about(neigh[0][1], u)
+                a2 = self._neighbor_belief_about(neigh[1][1], u)
+            elif len(neigh) == 1:
+                a1 = self._neighbor_belief_about(neigh[0][1], u)
+                a2 = (0.0, 0.0, 1.0)  # 纯不确定
+            else:
+                # 无邻居，退化：使用自身 trust 形成模糊证据
+                t = u.trust()
+                a1 = (t, 1.0 - t, 0.0)
+                a2 = (0.0, 0.0, 1.0)
+
+            mT = self._dst_combine(a1, a2)        # Eq.(7)-(10) 的组合
+            tr = self._final_trust_rate(mT)        # 作为最终信任率
+            scored.append((tr, u))
+
+        # 5) 以 DST 信任率排序，依次选 CH；并用概率门控（与框架 BASE_P_CH 协同）
+        scored.sort(key=lambda x: x[0], reverse=True)
+        for tr, u in scored:
+            if len(sim.clusters) >= target_ch:
+                break
+            p = clamp(BASE_P_CH * (0.60 + 0.80 * tr), 0.0, 1.0)
+            if random.random() < p:
+                self._appoint_ch(u)
+
+        # 兜底：若仍不足，直接按分数补齐
+        if len(sim.clusters) < target_ch:
+            for _, u in scored:
+                if len(sim.clusters) >= target_ch:
+                    break
+                if u.nid not in sim.clusters:
+                    self._appoint_ch(u)
+
+    def _appoint_ch(self, n: Node):
+        sim = self.sim
+        if n.nid in sim.clusters:
+            return
+        n.is_ch = True
+        n.last_ch_round = sim.round
+        sim.clusters[n.nid] = Cluster(n.nid)
+
+    def _recycle_existing_chs(self):
+        """Phase 2: CH 回收（min_erg=0.6, tl=60）"""
+        sim: Simulation = self.sim
+        to_remove = []
+        for ch_id, cl in list(sim.clusters.items()):
+            n = sim.node_by_id(ch_id)
+            if not n or (not n.alive):
+                to_remove.append(ch_id); continue
+            base = getattr(n, "initial_energy", n.energy)
+            min_erg = self.MIN_ERG_RATIO * base
+            # 条件：能量低于阈值 或 已到达 tl
+            due = ((sim.round - n.last_ch_round) >= self.TL_ROUNDS)
+            low = (n.energy <= min_erg)
+            if low or due:
+                n.is_ch = False
+                to_remove.append(ch_id)
+        for cid in to_remove:
+            sim.clusters.pop(cid, None)
+
+    # --------------------------- Phase 2：成员冗余（论文未主张） ---------------------------
+    def allow_member_redundancy(self, member: Node, ch: Node) -> bool:
+        return False
+
+    # --------------------------- Phase 3：WOA 选路（返回下一跳） ---------------------------
+    def choose_ch_relay(self, ch: Node, ch_nodes: List[Node]):
         """
-        Phase-1：按论文伪代码：
-          - 计算每个节点的 DST 信任合成值
-          - 以合成值从高到低挑选；并考虑 cooldown/回收（Phase-2 的 tl/min_erg）
+        以 WOA 在“直达 + 一跳中继”方案中择优，符合 Eq.(11)-(12) 的适应度最大化。
+        由于主程序逐跳发送，此处将“解”定义为：候选下一跳的索引（含直达 BS 的虚拟选项）。
         """
         sim = self.sim
-        alive = [n for n in sim.alive_nodes() if not n.blacklisted]
-        if not alive: return
 
-        # 动态能量基线（用于回收判据）：用存活节点能量中位数近似“初始能量比例”
-        med_e = float(np.median([n.energy for n in alive]))
-
-        scored: List[Tuple[float, Node]] = []
-        for n in alive:
-            if (sim.round - n.last_ch_round) < CH_COOLDOWN:
+        # 候选邻居（通信邻域内的其他 CH）
+        pool: List[Node] = []
+        for other in ch_nodes:
+            if other.nid == ch.nid or (not other.alive):
                 continue
-            # Phase-2: 回收判据（min_erg/tl）提前过滤
-            too_old = (sim.round - n.last_ch_round) >= self.ttl_rounds and getattr(n, "is_ch", False)
-            too_low = (n.energy <= self.min_erg_ratio * max(1e-9, med_e)) and getattr(n, "is_ch", False)
-            if too_old or too_low:
-                n.is_ch = False  # 触发回收：不允许继续担任
-                continue
+            if dist(ch.pos(), other.pos()) <= CH_NEIGHBOR_RANGE:
+                pool.append(other)
 
-            cs = self._dst_trust_of_node(n, alive)  # DST 合成置信
-            scored.append((cs, n))
+        # 将“直达 BS”视为一个额外选项（索引 = -1）
+        K = len(pool) + 1  # 最后一个“类别”表示直达
+        if K <= 0:
+            self.last_relay_by_ch[ch.nid] = None
+            return None, {}
 
-        # 以 DST 置信降序选择前 8% 作为 CH（增加簇头数量）
-        scored.sort(key=lambda t: t[0], reverse=True)
-        need_total = max(1, int(0.08 * len(alive)))
-        sim.clusters.clear()
-        for _, pick in scored[:need_total]:
-            pick.is_ch = True
-            pick.last_ch_round = sim.round
-            sim.clusters[pick.nid] = Cluster(pick.nid)
+        # ========== WOA 初始化 ==========
+        P = min(10, max(4, self.WOA_POP_FACTOR * K))
+        iters = self.WOA_ITERS
 
-    # ========== Phase-2：CH Recycling 的运行时检查 ==========
+        # 个体位置：实数 in [0, K-1]，离散化取最近索引；索引 K-1 代表直达
+        def rnd_pos():
+            return random.random() * max(1.0, (K - 1))
+
+        X = [rnd_pos() for _ in range(P)]
+        X_best = X[0]
+        F_best = -1e18
+
+        def discretize(x: float) -> int:
+            idx = int(round(clamp(x, 0.0, max(0.0, K - 1))))
+            return idx  # [0..K-1]；K-1 == 直达
+
+        def fitness_for_idx(idx: int) -> float:
+            """
+            Eq.(11)-(12) 的实现：
+              - 路径为 [CH] -> [候选] -> [BS] 或 [CH]->[BS]（直达）
+              - E: 路径节点（不含 BS）能量归一平均（对齐论文定义“Residual energy (E)”）
+              - D: CH 与候选中继的距离（直达时取 +∞，其 1/D = 0）
+              - H: 跳数（直达=1，中继=2）
+              - Scdis: 按 Eq.(12) 计算的均值路径段长度
+            """
+            # 构造路径
+            if idx == (K - 1):  # 直达
+                pts = [ch.pos(), sim.bs]
+                H = 1.0
+                D = float('inf')
+                energies = [ch.energy]
+            else:
+                nb = pool[idx]
+                pts = [ch.pos(), nb.pos(), sim.bs]
+                H = 2.0
+                D = dist(ch.pos(), nb.pos())
+                energies = [ch.energy, nb.energy]
+
+            # 归一化量纲：距离都以 CH_NEIGHBOR_RANGE 为参考
+            Scdis = _avg_path_distance(pts)
+            Scdis_norm = Scdis / (CH_NEIGHBOR_RANGE + 1e-9)
+
+            # 1/D 项（直达时为 0）
+            inv_D = 0.0 if (not np.isfinite(D)) else 1.0 / max(D, 1e-9)
+
+            # E：能量归一（对当前邻域的最大能量归一化）
+            e_ref = max([ch.energy] + [n.energy for n in pool]) if pool else ch.energy
+            Ehats = [clamp(e / (e_ref + 1e-9), 0.0, 1.0) for e in energies]
+            E_term = float(np.mean(Ehats))
+
+            # 适应度（Eq.(11)）
+            fit = E_term + inv_D + (1.0 / H) + (1.0 / max(Scdis_norm, 1e-6))
+            return fit
+
+        def evaluate(xlist: List[float]) -> Tuple[List[float], List[int]]:
+            Is = [discretize(x) for x in xlist]
+            Fs = [fitness_for_idx(i) for i in Is]
+            return Fs, Is
+
+        # 初始评价
+        F, Ixs = evaluate(X)
+        F_best = max(F)
+        X_best = X[int(np.argmax(F))]
+
+        # ========== 主循环（标准 WOA） ==========
+        for t in range(iters):
+            a = 2.0 - 2.0 * (t / max(1.0, (iters - 1)))  # a from 2 -> 0
+            for p in range(P):
+                r1 = random.random(); r2 = random.random()
+                A = 2.0 * a * r1 - a
+                C = 2.0 * r2
+
+                # 0.5 的分支：encircling / 探索；否则 spiral
+                if random.random() < 0.5:
+                    if abs(A) < 1:
+                        D_vec = abs(C * X_best - X[p])
+                        X[p] = X_best - A * D_vec
+                    else:
+                        # 远离一个随机解
+                        rand_idx = random.randint(0, P - 1)
+                        D_vec = abs(C * X[rand_idx] - X[p])
+                        X[p] = X[rand_idx] - A * D_vec
+                else:
+                    # 螺旋更新
+                    l = random.uniform(-1.0, 1.0)
+                    D_sp = abs(X_best - X[p])
+                    X[p] = D_sp * math.exp(self.WOA_B * l) * math.cos(2.0 * math.pi * l) + X_best
+
+            # 迭代末评价
+            F, Ixs = evaluate(X)
+            idx = int(np.argmax(F))
+            if F[idx] > F_best:
+                F_best = F[idx]
+                X_best = X[idx]
+
+        # 离散化得到最终选择
+        best_idx = discretize(X_best)
+        if best_idx == (K - 1):
+            # 直达
+            self.last_relay_by_ch[ch.nid] = None
+            return None, {'fitness': F_best, 'mode': 'direct'}
+        else:
+            relay = pool[best_idx]
+            self.last_relay_by_ch[ch.nid] = relay.nid
+            return relay, {'fitness': F_best, 'mode': 'relay', 'relay_id': relay.nid}
+
+    # --------------------------- 监督与可信/黑名单更新 ---------------------------
     def apply_watchdog(self, ch: Node, ok: bool, timely: bool, ch_nodes: List[Node]):
         """
-        按论文 Phase-2：若 CH 电量跌破 min_erg 或超出 tl（round 近似秒），则“需要回收”；
-        这里以累计击穿形式记录，统一在 finalize 中处理（与框架风格一致）。
+        将本轮 CH->relay 的成功/失败计入 obs(i->j)，作为 DST 的邻居证据来源。
         """
-        sim = self.sim
-        alive = sim.alive_nodes()
-        med_e = float(np.median([n.energy for n in alive])) if alive else 0.0
+        relay_id = self.last_relay_by_ch.get(ch.nid, None)
+        if relay_id is None:
+            # 直达：不产生对等体观测，但仍计入 CH 的 Beta-trust 统计
+            if ok and timely:
+                ch.observed_success += 0.6
+            else:
+                ch.observed_fail += 0.5
+                ch.consecutive_strikes = getattr(ch, "consecutive_strikes", 0) + 1
+            return
 
-        energy_low = (ch.energy <= self.min_erg_ratio * max(1e-9, med_e))
-        time_over  = ((sim.round - ch.last_ch_round) >= self.ttl_rounds)
-
-        breach = energy_low or time_over or (not ok) or (not timely)
-        if breach:
-            ch.observed_fail += 1.0
-            ch.consecutive_strikes += 1
-            # 标记建议回收
-            ch.to_recycle = True
+        rec = self._get_obs(ch.nid, relay_id)
+        if ok and timely:
+            rec['p'] += 1.0
+            rec['last_ok'] = 1.0
+            ch.observed_success += 0.6
+            ch.consecutive_strikes = max(0, getattr(ch, "consecutive_strikes", 0) - 1)
         else:
-            ch.observed_success += 1.0
-            ch.consecutive_strikes = max(0, ch.consecutive_strikes - 1)
-            ch.to_recycle = False
+            rec['n'] += 1.0
+            rec['last_ok'] = 0.0
+            ch.observed_fail += 0.5
+            ch.consecutive_strikes = getattr(ch, "consecutive_strikes", 0) + 1
 
     def finalize_trust_blacklist(self):
-        """指数遗忘更新信任；满足低信任+多次击穿则拉黑；执行回收。"""
+        """
+        与主程序 Beta-trust 模型对齐：指数遗忘 + 本轮观测累积；
+        拉黑条件：低信任并有击穿，或连续击穿次数超阈。
+        """
         for n in self.sim.alive_nodes():
             n.trust_s = n.trust_s * self.forget + n.observed_success
             n.trust_f = n.trust_f * self.forget + n.observed_fail
-            if getattr(n, "to_recycle", False):
-                n.is_ch = False  # 执行回收
-            if (n.trust() < self.trust_black) and (n.consecutive_strikes >= 1 or n.observed_fail > n.observed_success):
-                n.blacklisted = True
-            if n.consecutive_strikes >= self.strike_threshold:
+            low_trust = (n.trust() < self.trust_blacklist)
+            if (low_trust and getattr(n, "consecutive_strikes", 0) >= 1) or \
+               (getattr(n, "consecutive_strikes", 0) >= self.strike_threshold):
                 n.blacklisted = True
 
-    # ========= Phase-3：WOA 路由 =========
-
-    # ------ 路由适应度：论文式(11)(12) ------
-    def _route_metrics(self, route: List[Node]) -> Tuple[float, float, int, float]:
-        """
-        route: [CH0=src, CH1, ..., CHk]  —— 最后从 CHk 直达 BS
-        返回 (E_norm, D_total, H, Scdis)
-          E_norm : 路径上 CH 节点能量的均值（按全局 CH 能量最大值归一）
-          D_total: CH 间总距离（加上 CHk→BS）
-          H      : 中继跳数（CH 间跳数 + 最后 CH→BS 视作 1 跳）
-          Scdis  : (D_total / H) —— 即平均链路距离（符合式(12)的平均）
-        """
-        if not route:
-            return 0.0, 1e9, 999, 1e9
-        sim = self.sim
-        e_max = max([n.energy for n in route]) if route else 1.0
-        e_norm = sum(n.energy for n in route) / (len(route) * (e_max + 1e-9))
-
-        # CH 间距离
-        d_sum = 0.0
-        for i in range(1, len(route)):
-            d_sum += dist(route[i-1].pos(), route[i].pos())
-        # 最后 CH -> BS
-        d_sum += dist(route[-1].pos(), sim.bs)
-
-        # 跳数：CH 间边数 + 1（最后到BS）
-        H = (len(route) - 1) + 1
-        scdis = d_sum / (H + 1e-9)
-        return e_norm, d_sum, H, scdis
-
-    def _fitness(self, route: List[Node]) -> float:
-        """
-        论文式(11)：Fitness = E + 1/D + 1/H + 1/Scdis
-        注意：为数值稳定做了极小值保护。
-        """
-        E, D, H, Sc = self._route_metrics(route)
-        return (E +
-                1.0 / (D + 1e-6) +
-                1.0 / (H + 1e-6) +
-                1.0 / (Sc + 1e-6))
-
-    # ------ 路由搜索基本图操作 ------
-    def _ch_neighbors(self, node: Node, ch_nodes: List[Node]) -> List[Node]:
+    # --------------------------- 辅助：邻域查询 ---------------------------
+    def _neighbors_within(self, node: Node, pool: List[Node], radius: float) -> List[Tuple[float, Node]]:
         out = []
-        for other in ch_nodes:
-            if other.nid == node.nid or (not other.alive): continue
-            if dist(node.pos(), other.pos()) <= CH_NEIGHBOR_RANGE:
-                out.append(other)
-        # 近者优先
-        out.sort(key=lambda n: dist(node.pos(), n.pos()))
+        p0 = node.pos()
+        for other in pool:
+            if other.nid == node.nid or (not other.alive):
+                continue
+            d = dist(p0, other.pos())
+            if d <= radius:
+                out.append((d, other))
         return out
-
-    # ------ 初始解：若干条可行路径（贪心/BFS 混合） ------
-    def _seed_routes(self, src: Node, ch_nodes: List[Node]) -> List[List[Node]]:
-        sim = self.sim
-        seeds: List[List[Node]] = []
-
-        # 贪心：每步选向 BS 更近的邻居
-        for _ in range(3):
-            path = [src]
-            curr = src
-            visited = {src.nid}
-            for __ in range(self.WOA_max_hops - 1):
-                neigh = self._ch_neighbors(curr, ch_nodes)
-                if not neigh: break
-                # 选“到BS更近 且 沟通距离更短 的”前若干个候选
-                neigh.sort(key=lambda n: (dist(n.pos(), sim.bs), dist(curr.pos(), n.pos())))
-                picked = None
-                for cand in neigh[:5]:
-                    if cand.nid not in visited:
-                        picked = cand; break
-                if picked is None: break
-                path.append(picked); visited.add(picked.nid); curr = picked
-                # 看是否直接到 BS 足够近（常量阈值：直接传比继续两跳更省）
-                if dist(curr.pos(), sim.bs) <= CH_NEIGHBOR_RANGE:
-                    break
-            seeds.append(path)
-
-        # BFS 限深若干条
-        from collections import deque
-        q = deque()
-        q.append([src])
-        seen = set([src.nid])
-        cnt = 0
-        while q and cnt < (self.WOA_POP - len(seeds)):
-            p = q.popleft()
-            curr = p[-1]
-            if len(p) >= self.WOA_max_hops:
-                seeds.append(p); cnt += 1; continue
-            for nb in self._ch_neighbors(curr, ch_nodes)[:6]:
-                if nb.nid in set(n.nid for n in p):  # 避免环
-                    continue
-                npth = p + [nb]
-                q.append(npth)
-                if dist(nb.pos(), self.sim.bs) <= CH_NEIGHBOR_RANGE:
-                    seeds.append(npth); cnt += 1
-                    if cnt >= (self.WOA_POP - len(seeds)): break
-        # 兜底：至少一条自身直达（若可）
-        if not seeds:
-            seeds = [[src]]
-        return seeds[:self.WOA_POP]
-
-    # ------ 离散 WOA 更新算子：围捕/螺旋/探索 ------
-    def _towards_best(self, curr: List[Node], best: List[Node], ch_nodes: List[Node]) -> List[Node]:
-        """Encircling prey（离散化）：按位置对齐，局部替换为 best 的对应节点并重新连通"""
-        if not best: return curr
-        res = [curr[0]]
-        i = 1
-        used = {curr[0].nid}
-        while i < min(len(curr), len(best)):
-            pick = best[i]
-            if pick.nid not in used and dist(res[-1].pos(), pick.pos()) <= CH_NEIGHBOR_RANGE:
-                res.append(pick); used.add(pick.nid)
-            else:
-                # 就近可达替代
-                neigh = self._ch_neighbors(res[-1], ch_nodes)
-                alt = next((n for n in neigh if n.nid not in used), None)
-                if alt: res.append(alt); used.add(alt.nid)
-                else: break
-            i += 1
-        return res
-
-    def _spiral_attack(self, curr: List[Node], best: List[Node], lval: float, ch_nodes: List[Node]) -> List[Node]:
-        """Bubble-net（螺旋，离散化）：对路径做 2-opt/段替换，趋向更短/更近 BS"""
-        if len(curr) < 3: return curr
-        a = random.randint(1, len(curr) - 2)
-        b = random.randint(a, len(curr) - 1)
-        new = curr[:a] + list(reversed(curr[a:b])) + curr[b:]
-        # 若断边不可达则回退
-        ok = True
-        for i in range(1, len(new)):
-            if dist(new[i-1].pos(), new[i].pos()) > CH_NEIGHBOR_RANGE:
-                ok = False; break
-        return new if ok and self._fitness(new) >= self._fitness(curr) else curr
-
-    def _random_explore(self, curr: List[Node], ch_nodes: List[Node]) -> List[Node]:
-        """Exploration：随机在某处插入/替换一个可达邻居"""
-        base = curr[:]
-        anchor_idx = random.randint(0, len(base)-1)
-        anchor = base[anchor_idx]
-        neigh = self._ch_neighbors(anchor, ch_nodes)
-        if not neigh: return base
-        cand = random.choice(neigh)
-        if cand.nid in [n.nid for n in base]: return base
-        # 尝试把 cand 插到 anchor 后
-        new = base[:anchor_idx+1] + [cand] + base[anchor_idx+1:]
-        # 可达性检查
-        ok = True
-        for i in range(1, len(new)):
-            if dist(new[i-1].pos(), new[i].pos()) > CH_NEIGHBOR_RANGE:
-                ok = False; break
-        return new if ok else base
-
-    def _woa_best_route(self, src: Node, ch_nodes: List[Node]) -> List[Node]:
-        """WOA 主过程：返回从 src 到 BS 的最佳 CH 路径（不含 BS）"""
-        pop = self._seed_routes(src, ch_nodes)
-        if not pop: pop = [[src]]
-        # 记录最好个体
-        best = max(pop, key=self._fitness)
-
-        # 标准 WOA：a 从 2 线性降到 0；p ∈ [0,1] 决定 bubble-net 或 encircle/search
-        for t in range(self.WOA_ITERS):
-            a = 2 - 2 * (t / max(1, self.WOA_ITERS - 1))
-            new_pop = []
-            for r in pop:
-                p = random.random()
-                A = 2 * a * random.random() - a
-                C = 2 * random.random()
-                if p < 0.5:
-                    if abs(A) < 1:
-                        # encircling prey
-                        nr = self._towards_best(r, best, ch_nodes)
-                    else:
-                        # search for prey（远离随机个体）
-                        rand_i = random.randrange(len(pop))
-                        nr = self._random_explore(pop[rand_i], ch_nodes)
-                else:
-                    # bubble-net (spiral)
-                    lval = random.uniform(-1, 1)
-                    nr = self._spiral_attack(r, best, lval, ch_nodes)
-                new_pop.append(nr)
-
-            # 精英保留 + 更新最优
-            new_best = max(new_pop + [best], key=self._fitness)
-            best = new_best
-            pop = new_pop
-
-        return best
-
-    def allow_member_redundancy(self, member: Node, ch: Node) -> bool:
-        # 论文未给出成员侧冗余转发，保持关闭
-        return False
-
-    def choose_ch_relay(self, ch: Node, ch_nodes: List[Node]):
-        """
-        Phase-3：利用 WOA 在 CH 图上找“全局最佳路径”，再取下一跳为该路径的第二个节点；
-        若路径长度为 1（仅自己），则直达 BS。
-        返回：(relay_node | None, debug_info)
-        """
-        if not ch_nodes or len(ch_nodes) == 1:
-            return None, {}
-
-        # 找最佳路径
-        best_route = self._woa_best_route(ch, ch_nodes)
-
-        # 计算能耗（两跳与直达对比，仅做调试信息，不做硬约束；论文适应度已包含 D/H/Scdis）
-        sim = self.sim
-        d_bs = dist(ch.pos(), sim.bs)
-        cost_direct = e_tx(DATA_PACKET_BITS, d_bs)
-
-        relay = None
-        if len(best_route) >= 2 and best_route[0].nid == ch.nid:
-            relay = best_route[1]
-
-        info = {}
-        if relay is not None:
-            d1 = dist(ch.pos(), relay.pos())
-            d2 = dist(relay.pos(), sim.bs)
-            cost_twohop = e_tx(DATA_PACKET_BITS, d1) + e_rx(DATA_PACKET_BITS) + e_tx(DATA_PACKET_BITS, d2)
-            info = {'route_len': len(best_route), 'cost1': cost_direct, 'cost2': cost_twohop}
-        return relay, info
