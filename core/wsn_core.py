@@ -151,6 +151,13 @@ class Simulation:
         self.HND = None;
         self.LND = None
         self.algo: AlgorithmBase = algo_ctor(self)
+        # >>> NEW: 端到端尝试计数（用于 total_p / pdr / drop_p）
+        self.total_generated = 0
+        # >>> ADDED: 误拉黑统计
+        self.false_blacklist_nodes: set[int] = set()
+        self.false_blacklist_events: int = 0
+        # 用于每轮快照
+        self._prev_blacklist_normals: set[int] = set()
 
     def _init_nodes(self):
         coords = np.column_stack([np.random.rand(self.n_nodes) * AREA_W,
@@ -215,6 +222,8 @@ class Simulation:
             for mid in cl.members:
                 m=self.nodes[mid]
                 if not m.alive: continue
+                # >>> NEW: 每个成员本轮1条业务 → 端到端一次尝试
+                self.total_generated += 1
                 allow=self.algo.allow_member_redundancy(m, ch)
                 rec=self._member_send(m, ch, allow, chs)
                 if mid not in data_events: data_events[mid]={'tx_paths':[], 'delivered':False,'timely':False}
@@ -297,45 +306,56 @@ class Simulation:
     def _member_send(self, m: Node, ch: Node, allow_redundancy: bool, chs: List[Node]):
         rec = []
         if m.node_type == "malicious" and random.random() < P_MAL_MEMBER_DROP:
-            self.total_drop += 1;
+            self.total_drop += 1
             return rec
-        d = dist(m.pos(), ch.pos());
+
+        d = dist(m.pos(), ch.pos())
         e = e_tx(DATA_PACKET_BITS, d)
+
         if m.energy >= e:
-            m.energy -= e;
+            m.energy -= e
             self.total_energy_used += e
+            # >>> NEW: 成员侧真实能耗（主路径）
+            self.member_energy_total += e
             if ch.energy >= e_rx(DATA_PACKET_BITS):
-                ch.energy -= e_rx(DATA_PACKET_BITS);
+                ch.energy -= e_rx(DATA_PACKET_BITS)
                 self.total_energy_used += e_rx(DATA_PACKET_BITS)
-                rec.append(ch.nid);
+                rec.append(ch.nid)
                 ch.queue_level += 1
             else:
                 ch.alive = False
         else:
-            m.alive = False;
-            self.total_drop += 1;
+            m.alive = False
+            self.total_drop += 1
             return rec
+
         if allow_redundancy and chs:
             alts = []
             for other in chs:
-                if other.nid == ch.nid or (not other.alive) or other.trust() < self.algo.trust_blacklist: continue
+                if other.nid == ch.nid or (not other.alive) or other.trust() < self.algo.trust_blacklist:
+                    continue
                 dd = dist(m.pos(), other.pos())
-                if dd <= COMM_RANGE: alts.append((dd, other))
+                if dd <= COMM_RANGE:
+                    alts.append((dd, other))
             if alts:
-                alts.sort(key=lambda x: x[0]);
+                alts.sort(key=lambda x: x[0])
                 dd, alt = alts[0]
                 ee = e_tx(DATA_PACKET_BITS, dd)
                 if m.energy >= ee:
-                    m.energy -= ee;
+                    m.energy -= ee
                     self.total_energy_used += ee
+                    # >>> NEW: 成员侧真实能耗（冗余路径）
+                    self.member_energy_total += ee
                     if alt.energy >= e_rx(DATA_PACKET_BITS):
-                        alt.energy -= e_rx(DATA_PACKET_BITS);
+                        alt.energy -= e_rx(DATA_PACKET_BITS)
                         self.total_energy_used += e_rx(DATA_PACKET_BITS)
-                        rec.append(alt.nid);
+                        rec.append(alt.nid)
                         alt.queue_level += 1
                     else:
                         alt.alive = False
-        self.member_energy_total += e * len(rec)
+
+        # >>> REMOVED: 不再使用 e * len(rec) 近似
+        # self.member_energy_total += e * len(rec)
         return rec
 
     def update_lifetime(self):
@@ -351,6 +371,10 @@ class Simulation:
             print(f"Algorithm: {self.algo.name}, Round: {self.round}")
         self.round += 1
 
+        # >>> ADDED: 轮次开始时快照——当前已被拉黑的 normal 节点
+        prev_norm_bl = set(n.nid for n in self.nodes if (n.node_type == "normal" and n.blacklisted))
+
+
         if len(self.alive_nodes()) == 0:
             self.update_lifetime();
             return False
@@ -358,13 +382,22 @@ class Simulation:
         self.assign_members();
         self.transmit_round();
         self.update_lifetime()
+
+        # >>> ADDED: 本轮 watchdog/黑名单后，计算“本轮新拉黑的正常节点”
+        curr_norm_bl = set(n.nid for n in self.nodes if (n.node_type == "normal" and n.blacklisted))
+        newly = curr_norm_bl - prev_norm_bl
+        if newly:
+            self.false_blacklist_events += len(newly)
+            self.false_blacklist_nodes.update(newly)
+
         alive_cnt = sum(1 for n in self.nodes if n.alive)
         ch_cnt = sum(1 for n in self.nodes if n.alive and n.is_ch)
         timely = (self.total_timely_delivered / max(self.total_delivered, 1))
         self.sum_ch_count += ch_cnt
         if len(self.clusters) > 0:
             import numpy as _np
-            csize = _np.mean([len(cl.members) for cl in self.clusters.values()])
+            # >>> CHANGED: 原来是 mean(len(members))，现在改为 len(members)+1（含CH）
+            csize = _np.mean([len(cl.members) + 1 for cl in self.clusters.values()])
             self.sum_cluster_size += csize;
             self.count_cluster_rounds += 1
         self.history.append({'round': self.round, 'alive': alive_cnt, 'chs': ch_cnt,
@@ -383,36 +416,55 @@ class Simulation:
             for _ in range(rounds):
                 if not self.step(): break
         finalE = sum(n.energy for n in self.nodes)
-        self.total_energy_used += (initE - finalE)
+        # >>> CHANGED: 避免二次累加。直接用能量余额法覆盖总能耗。
+        self.total_energy_used = (initE - finalE)
+
         bl_mal = sum(1 for n in self.nodes if (n.node_type == "malicious" and n.blacklisted))
-        bl_norm = sum(1 for n in self.nodes if (n.node_type == "normal" and n.blacklisted))
+        # >>> CHANGED: 正常节点被拉黑（去重）
+        bl_norm_nodes = len(self.false_blacklist_nodes)
+        # >>> ADDED: 误拉黑事件累计（跨轮新增次数）
+        bl_norm_events = int(self.false_blacklist_events)
+        # >>> ADDED: 端到端口径
+        e2e_total = self.total_generated
+        e2e_deliv = self.total_delivered
+        e2e_drop = max(e2e_total - e2e_deliv, 0)
+        # >>> REPLACE in run() 指标计算片段
         energy_rate = self.member_energy_effective / max(self.member_energy_total, 1.0)
-        timely_rate = self.total_timely_delivered / max(self.total_delivered, 1)
-        pdr = self.total_delivered / max(self.total_delivered + self.total_drop, 1)
+
+        # >>> CHANGED: 全部用 e2e_* 口径
+        timely_rate = self.total_timely_delivered / max(e2e_deliv, 1)
+        pdr = e2e_deliv / max(e2e_total, 1)
+
         avg_ch = self.sum_ch_count / max(len(self.history), 1)
         avg_cluster = self.sum_cluster_size / max(self.count_cluster_rounds, 1)
-        avg_hops = self.total_hop_count / max(self.total_delivered, 1)
-        energy_per_del = self.total_energy_used / max(self.total_delivered, 1)
-        throughput = (self.total_delivered * DATA_PACKET_BITS) / max(len(self.history), 1)
+        avg_hops = self.total_hop_count / max(e2e_deliv, 1)  # <<< 用 e2e_deliv
+        energy_per_del = self.total_energy_used / max(e2e_deliv, 1)  # <<< 用 e2e_deliv
+        throughput = (e2e_deliv * DATA_PACKET_BITS) / max(len(self.history), 1)  # <<< 用 e2e_deliv
+
         return ({
                     'algo': self.algo.name,
                     'FND': self.FND if self.FND is not None else self.round,
                     'HND': self.HND if self.HND is not None else self.round,
                     'LND': self.LND if self.LND is not None else self.round,
-                    'drop_p': int(self.total_drop),
-                    'total_p': int(self.total_delivered),
+                    # >>> CHANGED: 端到端口径
+                    'drop_p': int(e2e_drop),
+                    'total_p': int(e2e_total),
                     'pdr': float(pdr),
+                    'drop_rate': float(1.0 - pdr),  # >>> NEW: 与CSV一致
                     'timely_transfer_rate': float(timely_rate),
                     'energy_rate': float(energy_rate),
                     'energy_per_delivered': float(energy_per_del),
                     'throughput_bits_per_round': float(throughput),
                     'avg_ch_per_round': float(avg_ch),
-                    'avg_cluster_size': float(avg_cluster),
+                    'avg_cluster_size': float(avg_cluster),  # 口径已在 step() 修正为含CH
                     'avg_hops_to_bs': float(avg_hops),
                     'malicious_delay': int(self.malicious_delay_times),
                     'malicious_drop': int(self.malicious_drop_packets),
                     'blacklisted_malicious': int(bl_mal),
-                    'blacklisted_normal': int(bl_norm),
+                    # >>> CHANGED: 原列 blacklisted_normal 现在表示“去重节点数”
+                    'blacklisted_normal': int(bl_norm_nodes),
+                    # >>> ADDED: 新增一列，表示“事件数”
+                    'false_blacklist_events': bl_norm_events,
                     'control_overhead_bits': int(self.total_control_bits),
                     'rounds_run': self.round
                 }, pd.DataFrame(self.history))
