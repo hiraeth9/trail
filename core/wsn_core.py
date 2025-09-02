@@ -160,9 +160,17 @@ class Simulation:
         self._prev_blacklist_normals: set[int] = set()
 
     def _init_nodes(self):
-        coords = np.column_stack([np.random.rand(self.n_nodes) * AREA_W,
-                                  np.random.rand(self.n_nodes) * AREA_H])
-        mal = set(self.rand.sample(range(self.n_nodes), self.n_malicious))
+        # 用本仿真的 seed 固定拓扑（同一 seed 下跨不同比例可公平对比）
+        rng = np.random.default_rng(self.seed)
+        xs = rng.random(self.n_nodes) * AREA_W
+        ys = rng.random(self.n_nodes) * AREA_H
+        coords = np.column_stack([xs, ys])
+
+        # 恶意集合“递增嵌套”：固定一个随机全排列，取前 k 个
+        order = list(range(self.n_nodes))
+        self.rand.shuffle(order)  # self.rand 已由 seed 播种
+        mal = set(order[:self.n_malicious])
+
         for i in range(self.n_nodes):
             t = "malicious" if i in mal else "normal"
             self.nodes.append(Node(i, float(coords[i, 0]), float(coords[i, 1]), t))
@@ -255,6 +263,16 @@ class Simulation:
             ok=False; timely=False; hops=0
             if do_drop:
                 self.malicious_drop_packets+=n_recv; self.total_drop+=n_recv
+                # 丢弃也要产生能量开销（例如无效直发/冲突）
+                if n_recv > 0:
+                    d_bs = dist(ch.pos(), self.bs)
+                    e_ch = e_tx(DATA_PACKET_BITS, d_bs)
+                    if ch.energy >= e_ch:
+                        ch.energy -= e_ch
+                        self.total_energy_used += e_ch
+                    else:
+                        ch.alive = False
+
                 ch.observed_fail+=1.0; ch.suspicion=min(1.0, ch.suspicion+0.3); ch.consecutive_strikes+=1
             else:
                 relay,_meta=self.algo.choose_ch_relay(ch, chs)
