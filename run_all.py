@@ -157,6 +157,7 @@ def plot_lines_with_error(df_all: pd.DataFrame, out_dir: str, seeds: int):
         ('FND', 'FND (First Node Dies)'),
         ('HND', 'HND (Half Nodes Die)'),
         ('LND', 'LND (Last Node Dies)'),
+        ('func_life_pdr90', 'Functional Lifetime (PDR≥0.90)'),
     ]
 
     for key, title in metrics:

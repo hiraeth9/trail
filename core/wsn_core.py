@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Any
 import numpy as np
 import pandas as pd
+from collections import deque
+
 
 SEED = 42
 AREA_W, AREA_H = 100.0, 100.0
@@ -158,6 +160,12 @@ class Simulation:
         self.false_blacklist_events: int = 0
         # 用于每轮快照
         self._prev_blacklist_normals: set[int] = set()
+        # === Functional Lifetime（功能寿命）配置与状态 ===
+        self.func_pdr_threshold = 0.85  # 阈值：窗口内平均PDR必须≥0.85
+        self.func_window = 100  # 滑动窗口长度（按轮数）
+        self.func_warmup = 200  # 前 200 轮不判定功能寿命
+        self._pdr_win = deque(maxlen=self.func_window)
+        self.functional_lifetime = None  # 首次跌破阈值时的轮次
 
     def _init_nodes(self):
         # 用本仿真的 seed 固定拓扑（同一 seed 下跨不同比例可公平对比）
@@ -388,6 +396,8 @@ class Simulation:
         if self.algo.name in target_algos:
             print(f"Algorithm: {self.algo.name}, Round: {self.round}")
         self.round += 1
+        prev_gen = self.total_generated
+        prev_del = self.total_delivered
 
         # >>> ADDED: 轮次开始时快照——当前已被拉黑的 normal 节点
         prev_norm_bl = set(n.nid for n in self.nodes if (n.node_type == "normal" and n.blacklisted))
@@ -400,6 +410,15 @@ class Simulation:
         self.assign_members();
         self.transmit_round();
         self.update_lifetime()
+        # === 计算本轮 PDR，并更新功能寿命 ===
+        gen_this = self.total_generated - prev_gen
+        del_this = self.total_delivered - prev_del
+        if self.round > self.func_warmup and gen_this > 0:
+            pdr_this = del_this / gen_this
+            self._pdr_win.append(pdr_this)
+            if (self.functional_lifetime is None) and (len(self._pdr_win) == self.func_window):
+                if (sum(self._pdr_win) / self.func_window) < self.func_pdr_threshold:
+                    self.functional_lifetime = self.round
 
         # >>> ADDED: 本轮 watchdog/黑名单后，计算“本轮新拉黑的正常节点”
         curr_norm_bl = set(n.nid for n in self.nodes if (n.node_type == "normal" and n.blacklisted))
@@ -464,6 +483,8 @@ class Simulation:
                     'FND': self.FND if self.FND is not None else self.round,
                     'HND': self.HND if self.HND is not None else self.round,
                     'LND': self.LND if self.LND is not None else self.round,
+                    'func_life_pdr90': int(self.functional_lifetime) if self.functional_lifetime is not None else int(
+                        self.round),
                     # >>> CHANGED: 端到端口径
                     'drop_p': int(e2e_drop),
                     'total_p': int(e2e_total),
