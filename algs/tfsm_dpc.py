@@ -68,7 +68,7 @@ class TFSM_DPC(AlgorithmBase):
 
     @property
     def strike_threshold(self) -> int:
-        return 3
+        return 35
 
     # ================= 内部状态 =================
     def __init__(self, *args, **kwargs):

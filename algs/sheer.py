@@ -66,7 +66,7 @@ class SHEER(AlgorithmBase):
     @property
     def strike_threshold(self) -> int:
         # 连续击穿达到该次数强制拉黑
-        return 3
+        return 35
 
     # ======== 内部工具 ========
     def _neighbors_within(self, node: Node, alive: List[Node], radius: float):

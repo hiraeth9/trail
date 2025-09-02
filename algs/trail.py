@@ -10,17 +10,17 @@ class TRAIL(AlgorithmBase):
     @property
     def name(self): return "TRAIL (ours)"
     @property
-    def trust_warn(self): return 0.60
+    def trust_warn(self): return 0.68
     @property
-    def trust_blacklist(self): return 0.40
+    def trust_blacklist(self): return 0.42
 
     @property
     def forget(self):
-        return 0.95
+        return 0.94
 
     @property
     def strike_threshold(self):
-        return 2
+        return 4
 
     def __init__(self, sim: 'Simulation'):
         super().__init__(sim)

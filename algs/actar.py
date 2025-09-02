@@ -85,7 +85,7 @@ class ACTAR(AlgorithmBase):
 
     @property
     def strike_threshold(self) -> int:
-        return 3
+        return 35
 
     # ========= 内部状态（用于 TAR 统计） =========
     def __init__(self, *args, **kwargs):
