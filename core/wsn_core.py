@@ -483,7 +483,7 @@ class Simulation:
                     'FND': self.FND if self.FND is not None else self.round,
                     'HND': self.HND if self.HND is not None else self.round,
                     'LND': self.LND if self.LND is not None else self.round,
-                    'func_life_pdr90': int(self.functional_lifetime) if self.functional_lifetime is not None else int(
+                    'func_life_pdr85': int(self.functional_lifetime) if self.functional_lifetime is not None else int(
                         self.round),
                     # >>> CHANGED: 端到端口径
                     'drop_p': int(e2e_drop),

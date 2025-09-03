@@ -30,6 +30,7 @@ METRIC_SPECS = {
     "avg_cluster_size":         {"label": "Average Cluster Size",          "percent": False, "unit": ""},
     # 安全/黑名单
     "malicious_drop":           {"label": "Malicious Drops",               "percent": False, "unit": "pkts"},
+    "malicious_delay":           {"label": "Malicious Delay",               "percent": False, "unit": "pkts"},
     "blacklisted_malicious":    {"label": "Blacklisted Malicious",         "percent": False, "unit": "nodes"},
     "blacklisted_normal":       {"label": "Blacklisted Normal (FP)",       "percent": False, "unit": "nodes"},
     "false_blacklist_events":   {"label": "False Blacklist Events",        "percent": False, "unit": "events"},
