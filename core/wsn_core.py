@@ -22,6 +22,8 @@ E_DA = 5e-9
 DATA_PACKET_BITS = 4000;
 CTRL_PACKET_BITS = 200
 
+# —— 控制面能量记账开关（可关掉做 A/B 对比）——
+ENABLE_HANDSHAKE_ENERGY = True
 SIM_ROUNDS = 500
 BASE_P_CH = 0.15
 
@@ -198,6 +200,43 @@ class Simulation:
                 ch.last_ch_round = self.round;
                 self.clusters[ch.nid] = Cluster(ch.nid)
 
+    # === NEW === 广播阶段（步骤 1/2）：CH 广播，成员接收
+    def advertise_phase(self):
+        if not ENABLE_HANDSHAKE_ENERGY:
+            return
+        alive = self.alive_nodes()
+        chs = [n for n in alive if n.is_ch]
+        if not chs:
+            return
+        for ch in chs:
+            if not ch.alive:
+                continue
+            # 只对“潜在成员”（非CH、在通信半径内）做一次覆盖性广播
+            receivers = [m for m in alive
+                         if (not m.is_ch) and m.alive and dist(m.pos(), ch.pos()) <= COMM_RANGE]
+            if not receivers:
+                continue
+            # 以最远成员距离近似一次广播所需发射功率
+            dmax = max(dist(ch.pos(), r.pos()) for r in receivers)
+            e_adv = e_tx(CTRL_PACKET_BITS, dmax)
+            if ch.energy >= e_adv:
+                # 簇头发广播
+                ch.energy -= e_adv
+                self.total_energy_used += e_adv
+                self.total_control_bits += CTRL_PACKET_BITS  # 记一次控制面比特
+                # 成员接收广播（逐个扣接收能量）
+                rx_cost = e_rx(CTRL_PACKET_BITS)
+                for r in receivers:
+                    if not r.alive:
+                        continue
+                    if r.energy >= rx_cost:
+                        r.energy -= rx_cost
+                        self.total_energy_used += rx_cost
+                    else:
+                        r.alive = False
+            else:
+                ch.alive = False
+
     def assign_members(self):
         alive = self.alive_nodes();
         chs = [n for n in alive if n.is_ch]
@@ -211,22 +250,49 @@ class Simulation:
                 if d <= COMM_RANGE: cands.append((d, ch))
             if not cands: n.cluster_id = None; continue
             cands.sort(key=lambda x: x[0]);
+            # 新版：3/4 维持原逻辑；新增 5/6 确认/时隙
             d0, chosen = cands[0]
             n.cluster_id = chosen.nid
-            e_ctrl = e_tx(CTRL_PACKET_BITS, d0)
-            if n.energy >= e_ctrl:
-                n.energy -= e_ctrl;
-                self.total_energy_used += e_ctrl;
+
+            # --- 3/4: 成员发送 JOIN，CH 接收 ---
+            e_join = e_tx(CTRL_PACKET_BITS, d0)
+            if n.energy >= e_join:
+                n.energy -= e_join
+                self.total_energy_used += e_join
                 self.total_control_bits += CTRL_PACKET_BITS
-                if chosen.energy >= e_rx(CTRL_PACKET_BITS):
-                    chosen.energy -= e_rx(CTRL_PACKET_BITS);
-                    self.total_energy_used += e_rx(CTRL_PACKET_BITS)
+                rx_cost = e_rx(CTRL_PACKET_BITS)
+                if chosen.energy >= rx_cost:
+                    chosen.energy -= rx_cost
+                    self.total_energy_used += rx_cost
                 else:
                     chosen.alive = False
+                    continue
             else:
-                n.alive = False;
+                n.alive = False
                 continue
-            self.clusters[chosen.nid].members.append(n.nid)
+
+            # --- 5/6: CH 下发确认/时隙，成员接收 ---
+            if ENABLE_HANDSHAKE_ENERGY:
+                e_ack = e_tx(CTRL_PACKET_BITS, d0)
+                if chosen.alive and chosen.energy >= e_ack:
+                    chosen.energy -= e_ack
+                    self.total_energy_used += e_ack
+                    self.total_control_bits += CTRL_PACKET_BITS
+                    rx_cost = e_rx(CTRL_PACKET_BITS)
+                    if n.alive and n.energy >= rx_cost:
+                        n.energy -= rx_cost
+                        self.total_energy_used += rx_cost
+                        # 只有确认成功才把成员加入簇
+                        self.clusters[chosen.nid].members.append(n.nid)
+                    else:
+                        n.alive = False
+                        continue
+                else:
+                    chosen.alive = False
+                    continue
+            else:
+                # 若关闭控制面记账，维持原先行为：直接加入簇
+                self.clusters[chosen.nid].members.append(n.nid)
 
     def transmit_round(self):
         alive=self.alive_nodes(); chs=[n for n in alive if n.is_ch]
@@ -271,16 +337,6 @@ class Simulation:
             ok=False; timely=False; hops=0
             if do_drop:
                 self.malicious_drop_packets+=n_recv; self.total_drop+=n_recv
-                # 丢弃也要产生能量开销（例如无效直发/冲突）
-                if n_recv > 0:
-                    d_bs = dist(ch.pos(), self.bs)
-                    e_ch = e_tx(DATA_PACKET_BITS, d_bs)
-                    if ch.energy >= e_ch:
-                        ch.energy -= e_ch
-                        self.total_energy_used += e_ch
-                    else:
-                        ch.alive = False
-
                 ch.observed_fail+=1.0; ch.suspicion=min(1.0, ch.suspicion+0.3); ch.consecutive_strikes+=1
             else:
                 relay,_meta=self.algo.choose_ch_relay(ch, chs)
@@ -407,9 +463,12 @@ class Simulation:
             self.update_lifetime();
             return False
         self.elect_cluster_heads();
+        # === NEW: 广播阶段（1/2）===
+        self.advertise_phase();
         self.assign_members();
         self.transmit_round();
         self.update_lifetime()
+
         # === 计算本轮 PDR，并更新功能寿命 ===
         gen_this = self.total_generated - prev_gen
         del_this = self.total_delivered - prev_del

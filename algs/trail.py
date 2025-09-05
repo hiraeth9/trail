@@ -59,7 +59,7 @@ class TRAIL(AlgorithmBase):
             b = 1.0 - (dist(n.pos(), sim.bs) - d_min) / (d_max - d_min + 1e-9)
             s_pen = 1.0 - max(0.0, min(1.0, 1.0 - n.suspicion))
             # 优化权重：提高信任权重，降低怀疑惩罚，增加队列和位置权重
-            score = 0.40 * e + 0.30 * (t - 0.08 * s_pen) + 0.18 * q + 0.12 * b
+            score = 0.40 * e + 0.30 * (t - 0.03 * s_pen) + 0.18 * q + 0.8 * b
             p = clamp(BASE_P_CH * (0.70 + score), 0.0, 1.0)
             if random.random()<p:
                 n.is_ch=True; n.last_ch_round=sim.round
