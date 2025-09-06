@@ -14,40 +14,68 @@ METRIC_SPECS = {
     # 可靠性
     "pdr":                      {"label": "PDR",                           "percent": True,  "unit": "%"},
     "drop_rate":                {"label": "Drop Rate",                     "percent": True,  "unit": "%"},
-    "timely_transfer_rate":     {"label": "Timely Transfer Rate",          "percent": True,  "unit": "%"},
+    "timely_transfer_rate":     {"label": "Timely Transfer Rate (Cond.)",  "percent": True,  "unit": "%"},
+    "timely_overall":           {"label": "Overall Timely Rate",           "percent": True,  "unit": "%"},  # NEW (⑥)
+
     # 寿命
     "FND":                      {"label": "FND (Rounds)",                  "percent": False, "unit": "rounds"},
     "HND":                      {"label": "HND (Rounds)",                  "percent": False, "unit": "rounds"},
     "LND":                      {"label": "LND (Rounds)",                  "percent": False, "unit": "rounds"},
     "func_life_pdr85":          {"label": "Functional Lifetime (PDR≥0.85)","percent": False, "unit": "rounds"},
+
     # 能耗/吞吐（派生列）
     "energy_mJ_per_pkt":        {"label": "Energy per Delivered",          "percent": False, "unit": "mJ/packet"},
     "throughput_kbit_round":    {"label": "Throughput",                    "percent": False, "unit": "kbit/round"},
-    "energy_rate":              {"label": "Energy Rate",                   "percent": True,  "unit": "%"},  # 若本列是比例
+    "bits_per_joule":           {"label": "Bits per Joule (BPJ)",          "percent": False, "unit": "bit/J"},  # NEW (③)
+    "energy_rate":              {"label": "Energy Rate",                   "percent": True,  "unit": "%"},
+
     # 拓扑/结构
     "avg_hops_to_bs":           {"label": "Average Hops to BS",            "percent": False, "unit": ""},
     "avg_ch_per_round":         {"label": "Avg CH per Round",              "percent": False, "unit": ""},
     "avg_cluster_size":         {"label": "Average Cluster Size",          "percent": False, "unit": ""},
+
     # 安全/黑名单
     "malicious_drop":           {"label": "Malicious Drops",               "percent": False, "unit": "pkts"},
-    "malicious_delay":           {"label": "Malicious Delay",               "percent": False, "unit": "pkts"},
+    "malicious_delay":          {"label": "Malicious Delay",               "percent": False, "unit": "pkts"},
     "blacklisted_malicious":    {"label": "Blacklisted Malicious",         "percent": False, "unit": "nodes"},
     "blacklisted_normal":       {"label": "Blacklisted Normal (FP)",       "percent": False, "unit": "nodes"},
     "false_blacklist_events":   {"label": "False Blacklist Events",        "percent": False, "unit": "events"},
-    # 控制开销（派生列）
+
+    # 控制开销（派生/论文向）
     "control_overhead_kbit":    {"label": "Control Overhead",              "percent": False, "unit": "kbit"},
+    "overhead_ratio":           {"label": "Overhead Ratio",                "percent": False, "unit": ""},      # NEW (④)
 }
+
 
 def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     """派生/换算一些更易读的列，不改变原 df"""
     d = df.copy()
+
+    # 单位换算
     if "energy_per_delivered" in d.columns and "energy_mJ_per_pkt" not in d.columns:
-        d["energy_mJ_per_pkt"] = d["energy_per_delivered"] * 1e3  # J -> mJ
+        d["energy_mJ_per_pkt"] = d["energy_per_delivered"] * 1e3  # J/bit -> mJ/bit
     if "throughput_bits_per_round" in d.columns and "throughput_kbit_round" not in d.columns:
         d["throughput_kbit_round"] = d["throughput_bits_per_round"] / 1000.0
     if "control_overhead_bits" in d.columns and "control_overhead_kbit" not in d.columns:
         d["control_overhead_kbit"] = d["control_overhead_bits"] / 1000.0
+
+    # === 论文向派生列 ===
+    # (③) BPJ: bit / J
+    if "energy_per_delivered" in d.columns and "bits_per_joule" not in d.columns:
+        d["bits_per_joule"] = 1.0 / d["energy_per_delivered"].replace(0, np.nan)
+
+    # (⑥) Overall timely: 端到端按时率 = PDR × 条件及时率
+    if {"pdr", "timely_transfer_rate"} <= set(d.columns) and "timely_overall" not in d.columns:
+        d["timely_overall"] = d["pdr"] * d["timely_transfer_rate"]
+
+    # (④) Overhead Ratio: 控制比特 / (有效载荷比特)
+    # 有效载荷比特近似 = 每轮吞吐 × 轮数
+    if {"control_overhead_bits", "throughput_bits_per_round", "rounds_run"} <= set(d.columns) and "overhead_ratio" not in d.columns:
+        denom = (d["throughput_bits_per_round"] * d["rounds_run"]).replace(0, np.nan)
+        d["overhead_ratio"] = d["control_overhead_bits"] / denom
+
     return d
+
 
 def get_algo_ctor(tag:str):
     mod_name, cls = ALGOS[tag]
@@ -68,6 +96,105 @@ def run_one(tag:str, n_nodes:int, n_malicious:int, seed:int, rounds:int, until_d
         hist.to_csv(os.path.join(out_dir, f'hist_{tag}.csv'), index=False)
     res['seed']=seed
     return res
+
+def plot_bar_with_table_highlight(
+    df,
+    xcol: str,
+    ycol_mean: str,
+    ycol_ci95: str,
+    ncol: str,
+    title: str,
+    ylabel: str,
+    out_path: str,
+    mode: str = "max"   # "max"：取最大为最佳；"closest_to_zero"：离0最近为最佳（用于斜率）
+):
+    """
+    生成“柱状图 + 表格”的合成图，并高亮最佳算法。
+    - df: 含统计列的 DataFrame（如 robustness_slope.csv 或 pdr_auc_ratio.csv）
+    - xcol: 类别列（通常为 'algo'）
+    - ycol_mean: 指标均值列（如 'pdr_slope_mean' 或 'auc_norm_mean'）
+    - ycol_ci95: 95%CI 列
+    - ncol: 样本量列（如 'n'）
+    - mode: 'max' 取最大为最佳；'closest_to_zero' 用 |值| 最小为最佳（适合“斜率越接近0越好”）
+    """
+    if df is None or len(df) == 0:
+        print(f"[WARN] plot_bar_with_table_highlight: empty df, skip {out_path}")
+        return
+
+    # 排序 & 找到最佳
+    if mode == "closest_to_zero":
+        # 表格按“离0最近”从好到差排列
+        df_plot = df.copy().assign(_rank=np.abs(df[ycol_mean].to_numpy()))
+        df_plot = df_plot.sort_values("_rank", ascending=True).drop(columns="_rank")
+        best_mask = (np.abs(df_plot[ycol_mean].to_numpy()) ==
+                     np.abs(df_plot[ycol_mean].to_numpy()).min())
+    else:
+        # 表格按均值从大到小排列
+        df_plot = df.sort_values(ycol_mean, ascending=False).copy()
+        best_mask = (df_plot[ycol_mean].to_numpy() == df_plot[ycol_mean].max())
+
+    # 准备画布（上：柱状图；下：表格）
+    fig = plt.figure(figsize=(9, 6.5))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3.5, 2.0])
+    ax_bar = fig.add_subplot(gs[0])
+    ax_tab = fig.add_subplot(gs[1])
+
+    # --- 柱状图 ---
+    xs = np.arange(len(df_plot))
+    ys = df_plot[ycol_mean].to_numpy()
+    yerr = df_plot[ycol_ci95].to_numpy() if (ycol_ci95 in df_plot.columns) else None
+
+    bars = ax_bar.bar(xs, ys)
+    if yerr is not None and not np.all(np.isnan(yerr)):
+        ax_bar.errorbar(xs, ys, yerr=yerr, fmt='none', capsize=3)
+
+    # 高亮最佳：给最佳柱子加星标 & 加粗 x 轴标签
+    for i, is_best in enumerate(best_mask):
+        if is_best:
+            ax_bar.text(xs[i], ys[i], "★", ha='center', va='bottom', fontsize=14)
+    labels = [f"{a}" + (" ★" if is_best else "") for a, is_best in zip(df_plot[xcol], best_mask)]
+    ax_bar.set_xticks(xs)
+    ax_bar.set_xticklabels(labels, rotation=15)
+    ax_bar.set_ylabel(ylabel)
+    ax_bar.set_title(title)
+    # 辅助线（斜率图用0线更直观）
+    if mode == "closest_to_zero":
+        ax_bar.axhline(0.0, linewidth=1)
+    ax_bar.grid(True, axis='y', linewidth=0.5, alpha=0.5)
+
+    # --- 表格 ---
+    # 将均值±CI 与 n 生成字符串；数值格式更论文向
+    def _fmt(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "–"
+        return f"{v:.3f}"
+
+    table_rows = []
+    for _, row in df_plot.iterrows():
+        mean_s = _fmt(row[ycol_mean])
+        ci_s   = _fmt(row[ycol_ci95]) if ycol_ci95 in df_plot.columns else "–"
+        n_s    = str(int(row[ncol])) if ncol in df_plot.columns and not np.isnan(row[ncol]) else "–"
+        table_rows.append([row[xcol], mean_s, ci_s, n_s])
+
+    col_labels = [xcol, "mean", "95%CI", "n"]
+    ax_tab.axis('off')
+    tbl = ax_tab.table(cellText=table_rows, colLabels=col_labels, loc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 1.2)
+
+    # 高亮最佳行（背景浅黄 & 加粗）
+    best_row_idx = np.where(best_mask)[0][0]  # 若有并列，会取第一个
+    # +1 因为第0行是表头
+    for j in range(len(col_labels)):
+        cell = tbl[(best_row_idx + 1, j)]
+        cell.set_facecolor('#fff7cc')
+        cell.set_text_props(fontweight='bold')
+
+    fig.tight_layout()
+    plt.savefig(out_path, dpi=240, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[图] 合成版已生成：{out_path}")
 
 def run_all_tags(tags, n_nodes:int, n_malicious:int, seeds:list, rounds:int, until_dead:bool, out_dir:str, suffix:str=""):
     os.makedirs(out_dir, exist_ok=True)
@@ -291,8 +418,96 @@ def main():
             plot_timely_curves(tags, out_dir, suffix=f'ratio_{int(r*100)}')
         df_all = pd.concat(all_rows, ignore_index=True)
         df_all.to_csv(os.path.join(out_dir, 'summary_all.csv'), index=False)
+        # === 派生列（BPJ/总体及时率/开销占比等） ===
+        df_all = add_derived_columns(df_all)
+
+        # === ① 稳健性斜率（PDR~ratio）——先 (algo,seed) 级拟合，再按 algo 聚合 ===
+        def _slope(x, y):
+            x = np.asarray(x);
+            y = np.asarray(y)
+            if len(np.unique(x)) < 2:
+                return np.nan
+            return np.polyfit(x, y, 1)[0]
+
+        # 修复 pandas FutureWarning：groupby 后先选子列再 apply
+        by_alg_seed_slope = (df_all
+                             .groupby(['algo', 'seed'])[['ratio', 'pdr']]
+                             .apply(lambda g: pd.Series({'pdr_slope': _slope(g['ratio'].to_numpy(),
+                                                                             g['pdr'].to_numpy())}))
+                             .reset_index())
+
+        robust = (by_alg_seed_slope.groupby('algo', as_index=False)
+                  .agg(pdr_slope_mean=('pdr_slope', 'mean'),
+                       pdr_slope_std=('pdr_slope', 'std'),
+                       n=('pdr_slope', 'count')))
+        robust['pdr_slope_ci95'] = 1.96 * robust['pdr_slope_std'] / np.sqrt(np.maximum(robust['n'], 1))
+
+        robust_out = os.path.join(out_dir, 'robustness_slope.csv')
+        robust.to_csv(robust_out, index=False)
+        print(f"[csv] {robust_out}")
+
+        # === ② AUC_R（PDR–ratio 曲线面积）——(algo,seed) 级，后按 algo 聚合 ===
+        def _auc_per_seed(g: pd.DataFrame) -> pd.Series:
+            sub = g[['ratio', 'pdr']].dropna().sort_values('ratio')
+            xs, ys = sub['ratio'].to_numpy(), sub['pdr'].to_numpy()
+            if len(xs) < 2 or np.isclose(xs.max(), xs.min()):
+                return pd.Series({'auc_raw': np.nan, 'auc_norm': np.nan})
+            # 修复 numpy DeprecationWarning: trapz -> trapezoid
+            try:
+                auc_raw = np.trapezoid(ys, xs)
+            except AttributeError:
+                auc_raw = np.trapz(ys, xs)
+            auc_norm = auc_raw / (xs.max() - xs.min())  # 归一化成“区间平均PDR”
+            return pd.Series({'auc_raw': auc_raw, 'auc_norm': auc_norm})
+
+        by_alg_seed_auc = (df_all
+                           .groupby(['algo', 'seed'])[['ratio', 'pdr']]
+                           .apply(_auc_per_seed)
+                           .reset_index())
+
+        auc_stat = (by_alg_seed_auc.groupby('algo', as_index=False)
+                    .agg(auc_norm_mean=('auc_norm', 'mean'),
+                         auc_norm_std=('auc_norm', 'std'),
+                         n=('auc_norm', 'count')))
+        auc_stat['auc_norm_ci95'] = 1.96 * auc_stat['auc_norm_std'] / np.sqrt(np.maximum(auc_stat['n'], 1))
+
+        auc_detail_path = os.path.join(out_dir, 'pdr_auc_ratio_detail.csv')
+        auc_out = os.path.join(out_dir, 'pdr_auc_ratio.csv')
+        by_alg_seed_auc.to_csv(auc_detail_path, index=False)
+        auc_stat.to_csv(auc_out, index=False)
+        print(f"[csv] {auc_out}")
+        print(f"[csv] {auc_detail_path}")
+
+        # === ③ 合成图：斜率（离0越近越好） & AUC_R（越大越好），并高亮最佳算法 ===
+        plot_bar_with_table_highlight(
+            df=robust,
+            xcol='algo',
+            ycol_mean='pdr_slope_mean',
+            ycol_ci95='pdr_slope_ci95',
+            ncol='n',
+            title='Robustness (PDR–ratio slope, closer to 0 is better)',
+            ylabel='Slope of PDR vs. ratio',
+            out_path=os.path.join(out_dir, 'fig_pdr_slope_bar_table.png'),
+            mode='closest_to_zero'
+        )
+
+        plot_bar_with_table_highlight(
+            df=auc_stat,
+            xcol='algo',
+            ycol_mean='auc_norm_mean',
+            ycol_ci95='auc_norm_ci95',
+            ncol='n',
+            title='Robustness (AUC_R over ratio range)',
+            ylabel='Normalized AUC of PDR–ratio (≈ mean PDR)',
+            out_path=os.path.join(out_dir, 'fig_auc_ratio_bar_table.png'),
+            mode='max'
+        )
+
+        # === 仍保留你原有的折线图输出（PDR/寿命等） ===
         plot_lines_with_error(df_all, out_dir, seeds=args.seeds)
-        print("批量完成：summary_all.csv 与 line_*.png 已生成。")
+        print(
+            "批量完成：summary_all.csv、robustness_slope.csv、pdr_auc_ratio*.csv、以及合成图 fig_*_bar_table.png 与 line_*.png。")
+
     else:
         seeds_list=list(range(42, 42+args.seeds))
         df = run_all_tags(tags, 100, 30, seeds_list, rounds=args.rounds,
